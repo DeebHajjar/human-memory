@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local data — personal memory content should never be committed
+# (fast_layer.json is auto-created with a blank template on first run
+# by memory/fast_layer.py, so it's safe to ignore entirely)
+data/archive.db
+data/fast_layer.json
+
+# Sentence-transformers model cache (if downloaded locally instead of ~/.cache)
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp

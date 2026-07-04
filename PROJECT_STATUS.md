@@ -1,0 +1,407 @@
+# Human Memory System — Project Status & Roadmap
+
+*Last updated: July 2026 — v1.1*
+
+---
+
+## 1. Overview
+
+The Human Memory System is a local, privacy-first memory layer for AI assistants, designed to mimic how human memory actually works rather than how a database works. It surfaces relevant context at the right moment, forgets trivial details over time, and permanently retains emotionally significant information — all while staying model-agnostic and fully offline after initial setup.
+
+This document describes:
+- What was built and verified in **v1** (Section 2)
+- A full evaluation of v1, including where it fails in real-world use (Section 3)
+- What was fixed in **v1.1** to address those failures, and how (Section 4)
+- What each future version (**v2 → v6**) must add, in detail (Section 5)
+
+---
+
+## 2. What Was Built — v1
+
+### 2.1 Scope delivered
+
+v1 implements the minimum end-to-end loop specified in the original design:
+
+```
+receive message → check if retrieval needed → retrieve relevant context
+→ send to LLM → store response → prune archive on schedule
+```
+
+Four components were built, tested, and packaged:
+
+| Component | File(s) | Status |
+|---|---|---|
+| Fast Layer | `memory/fast_layer.py`, `memory/models.py` | ✅ Built & tested |
+| Archive (SQLite + embeddings) | `memory/archive.py` | ✅ Built & tested |
+| Retrieval logic (keyword-only) | `memory/retrieval.py` | ✅ Built & tested |
+| Forgetting system | `memory/forgetting.py`, `scheduler.py` | ✅ Built & tested |
+| MCP Server | `mcp_server.py`, `main.py` | ✅ Built (pending live run) |
+
+### 2.2 Fast Layer
+
+A JSON file (`data/fast_layer.json`) holding the user's core identity:
+- Name, age, language
+- Personality traits
+- Key preferences and values
+- Currently active task ID (placeholder — Task Layer not yet built)
+
+This layer is always loaded on every request, never retrieved via search. It is intentionally small, stable, and human-editable — the user can open the file and edit it directly.
+
+**Verified behavior:** save/load round-trip preserves all fields correctly; missing or malformed files fall back to safe defaults without crashing.
+
+### 2.3 Archive Layer
+
+A local SQLite database (`data/archive.db`) storing every memory entry with:
+- `id`, `content`, `summary`, `embedding` (BLOB), `importance_score`
+- `frequency_score`, `recency_score`, `emotional_weight`
+- `timestamp`, `last_accessed`, `access_count`, `tags`, `source`
+
+Embeddings are generated locally using `sentence-transformers` (`all-MiniLM-L6-v2`, 384 dimensions) — no external API calls, no data leaves the machine.
+
+**Verified behavior:** entries store and retrieve correctly; access tracking (`mark_accessed`) increments properly; tag indexing works for the retrieval trigger; compression and deletion operations behave as expected.
+
+### 2.4 Retrieval Logic (v1 = keyword-only)
+
+Per the v1 spec, only **Step 1 (keyword triggers)** was implemented — the LLM-judgment fallback (Step 2) is deliberately deferred to a later version.
+
+Two trigger types were built:
+1. **Time/context reference phrases** — in both English (*"last time," "remember when," "we discussed"*) and Arabic (*"من قبل," "تذكر," "قلت"*), reflecting the user's bilingual context.
+2. **Known tag matching** — if any word in the incoming message matches a tag already present in the archive, retrieval fires.
+
+When retrieval fires, the system performs a semantic search using cosine similarity between the query embedding and all stored embeddings, combined with each entry's importance score:
+
+```
+combined_score = 0.7 × similarity + 0.3 × importance_score
+```
+
+Results above a configurable threshold (default `0.30`) are returned, ranked, and capped at `top_k` (default `5`).
+
+**Verified behavior:** English and Arabic time-reference triggers fire correctly; tag-based triggers fire correctly; plain factual questions with no memory relevance correctly do **not** trigger retrieval.
+
+### 2.5 Forgetting System
+
+A scoring formula runs on a weekly schedule (via `APScheduler`, embedded in the same process — no separate daemon):
+
+```
+importance_score = frequency_score × 0.4 + recency_score × 0.3 + emotional_weight × 0.3
+```
+
+- `frequency_score` — access count normalized against the most-accessed entry
+- `recency_score` — exponential decay from last access, 60-day half-life
+- `emotional_weight` — manually or automatically assigned significance (0–1)
+
+**Pruning rules applied every cycle:**
+
+| Condition | Action |
+|---|---|
+| `importance_score < 0.2` AND age ≥ 30 days | Delete permanently |
+| `importance_score < 0.4` AND age ≥ 90 days | Compress to a short summary, re-embed |
+| `emotional_weight = 1.0` | Never deleted, only eligible for compression after very long periods |
+
+**Verified behavior:** an artificially aged, low-importance entry was correctly deleted after one cycle; an entry with maximum emotional weight was correctly protected from deletion regardless of age or access count.
+
+### 2.6 MCP Server
+
+Built using the `mcp` Python library (`FastMCP`), running on **stdio transport** — meaning it never opens a network port and integrates with any MCP-compatible client.
+
+Two tools are exposed, exactly as scoped for v1:
+
+**`get_context(message: str)`**
+Returns the fast layer (always) plus retrieved archive entries (only if triggered). Called before the LLM generates a response.
+
+**`store_memory(content, source, importance, tags, emotional_weight)`**
+Stores a new entry in the archive with a locally generated embedding. Called after the LLM generates a response.
+
+**Status:** code is complete and syntactically verified, but has not yet been run end-to-end with a live MCP client (e.g. Claude Desktop) because the current environment cannot reach Hugging Face to download the embedding model. This is the first thing to verify locally.
+
+### 2.7 What was explicitly excluded from v1 (by design)
+
+Per the original specification, the following were intentionally **not** built yet:
+- Warm Layer
+- Task Layer
+- Topic-switching buffer
+- LLM-based retrieval judgment (Step 2 of the decision logic)
+- AI internal thought memory
+- Personality/beliefs layer
+
+---
+
+## 3. Full Evaluation of v1 — Where It Fails in Real-World Use
+
+v1's individual components were unit-tested and behave correctly in isolation. This section evaluates the system as a whole, as it would actually be used, and identifies structural failure points — not bugs, but design gaps that would surface with real usage over time.
+
+### 3.1 The core problem: storage and context injection depend on the model's own choice
+
+This is the most serious issue in v1, and it's structural rather than a simple bug.
+
+**Why it happens:** MCP is a client-driven protocol. The server (`mcp_server.py`) is entirely passive — it cannot "push" itself into a conversation. It can only wait for the calling model to decide to invoke `get_context` or `store_memory`. The `instructions` text in the `FastMCP` constructor is a strong hint to the model, but it is not a technical guarantee.
+
+**Realistic failure scenarios:**
+- In a long conversation, the system instructions get buried under growing context, and the model simply stops calling `get_context` — meaning even the Fast Layer, which is meant to be *always* present, silently disappears.
+- A weaker model (or even a strong model on an off turn) judges a message as "not needing memory" and skips `get_context` entirely.
+- `store_memory` gets called inconsistently — sometimes after an important exchange, sometimes not — leaving the archive incomplete and unreliable over time.
+
+This is exactly the problem raised directly by the user, and it required an architectural fix, not a configuration tweak — see Section 4.1.
+
+### 3.2 The embedding model does not support Arabic well
+
+`all-MiniLM-L6-v2` is trained primarily on English. Since the user works bilingually in Arabic and English, semantic search on Arabic messages would frequently fail to find relevant matches even when the meaning was clearly related — because the underlying vector space doesn't represent Arabic semantics well.
+
+### 3.3 The weekly forgetting cycle likely never runs
+
+`scheduler.py` (v1) relied on `APScheduler`'s in-process interval timer, which only fires if the process stays alive continuously for a full week. MCP server processes are typically **not** long-running daemons — clients like Claude Desktop/Code start the process per session and stop it afterward. In realistic usage, the process might live for minutes, not seven days, so the forgetting cycle may simply never trigger.
+
+### 3.4 No automatic importance/emotional-weight extraction
+
+In v1, `importance` and `emotional_weight` were entirely up to whatever value the calling model passed into `store_memory`. In practice this leads to inconsistency: one model might default everything to `0.5` out of laziness; another might mark everything `emotional_weight = 1.0`, which would defeat the forgetting system entirely by making nothing eligible for deletion. Since these fields directly drive Section 2.5's pruning rules, inconsistent input here undermines the entire forgetting system regardless of how well-tuned the formula itself is.
+
+### 3.5 Keyword-only retrieval triggers will both under-fire and over-fire
+
+This is an accepted, *documented* limitation of v1 (the spec explicitly deferred LLM-based judgment to v4), but it's worth stating clearly:
+- **Under-fires:** a message like "how did the tracker project go?" (no exact keyword match, no known tag match) would not trigger retrieval even though it's clearly asking about stored context.
+- **Over-fires:** if a generic word (e.g. "life") became a stored tag, any unrelated sentence containing that word would trigger an unnecessary archive search.
+
+### 3.6 No conflict or duplicate detection
+
+If the user's situation changes (e.g., a stored fact becomes outdated), v1 has no mechanism to detect that a new statement contradicts or supersedes an old one. Both versions could be retrieved together in the future, potentially confusing the responding model with stale, conflicting information.
+
+---
+
+## 4. What Was Fixed — v1.1
+
+v1.1 addresses the three issues identified as structural (not deferrable to a later layer): the model-dependent storage problem, the Arabic embedding gap, and the broken forgetting schedule. Sections 3.5 and 3.6 remain open — 3.5 is intentionally deferred to v4 per the original spec, and 3.6 is deferred to a later version (see Section 8).
+
+### 4.1 Fix: deterministic Gateway + rule-based auto-extraction
+
+**New file: `memory/gateway.py`**
+
+A `MemoryGateway` class was added that removes the model's ability to "skip" memory operations, for any integration that routes through it:
+
+- `build_context()` — called unconditionally before every model call. Always returns the Fast Layer, always runs the retrieval-trigger check. No tool-call decision involved.
+- `auto_store_turn()` — called unconditionally after every model call. Runs rule-based extraction on both the user's message and the assistant's reply and stores whatever clears the bar, without waiting for the model to decide to call `store_memory`.
+- `process_turn()` — a convenience wrapper that runs the full deterministic loop (`build_context` → call the model → `auto_store_turn`) in one call.
+
+**New file: `memory/auto_extract.py`**
+
+A **rule-based, non-LLM** extraction engine that decides, deterministically:
+- Whether an exchange is trivial enough to skip (e.g. "ok", "thanks", "تمام") — using a word-count check rather than a flat character cutoff, since Arabic can express a complete statement in fewer characters than English (this was caught and fixed during testing — see 4.4).
+- A default importance score, raised automatically when the text matches identity/preference/decision phrasing (bilingual pattern list: "my name is" / "اسمي", "I prefer" / "أفضل", "I decided" / "قررت", etc.).
+- An emotional weight of `1.0` automatically, when the text matches strong life-event phrasing (bilingual: "I got married" / "تزوجت", "I lost my job" / "فقدت وظيفتي", etc.) — directly solving the "everything becomes emotional_weight=1.0" inconsistency described in 3.4.
+- Candidate tags, extracted heuristically from capitalized words/proper nouns.
+
+This is intentionally rule-based rather than LLM-based for this specific job: an LLM-based *retrieval* judgment (deferred to v4) can afford to be wrong occasionally, since a missed retrieval just means one less relevant memory surfaced. An LLM-based *storage* judgment being wrong could mean silently losing information forever — a much higher-stakes mistake — so a predictable, auditable rule set was chosen for now.
+
+**Important documented limitation:** this fix fully solves the problem for direct API integrations (a custom wrapper around the OpenAI/Gemini/Claude API using `MemoryGateway` directly — see the updated README). It does **not** fully solve it for MCP-native clients like Claude Desktop/Code, because MCP's protocol gives the *client*, not the server, control over when tools are called — this is a protocol-level constraint, not a gap in this codebase.
+
+**Partial mitigation added for MCP-native clients (`mcp_server.py`):**
+- `get_context` — the tool most reliably called every turn by an MCP client trying to be helpful — now also opportunistically auto-stores the incoming user message as a side effect, using the same rule-based engine. This does not capture the assistant's own reply (only the Gateway path guarantees that), but it meaningfully reduces data loss on the user-message side even without `store_memory` ever being called.
+- `store_memory`'s `importance`, `tags`, and `emotional_weight` parameters are now optional (previously had hardcoded defaults). When the calling model omits them, the server falls back to the same rule-based extraction used by the Gateway, instead of a flat `0.5` default — so behavior is consistent regardless of whether a model bothers to compute these values itself.
+- The MCP server's `instructions` text was strengthened to explicitly tell the model to call `get_context` on *every* message, even ones that seem unrelated to memory, specifically because it now also keeps the Fast Layer current and opportunistically captures the user's message.
+
+### 4.2 Fix: multilingual embeddings
+
+**Changed file: `config.py`**
+
+```python
+# Before (v1):  EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+# After (v1.1): EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+```
+
+Same embedding dimension (384) and same `.encode()` interface, so no other code needed to change. This model supports Arabic and English (and dozens of other languages) with comparable quality, directly fixing the gap identified in 3.2. Trade-off: the model download is larger (~470 MB vs ~90 MB) — a one-time cost, still fully offline afterward.
+
+### 4.3 Fix: forgetting-cycle startup catch-up
+
+**New table:** `system_state` (key/value) added to the existing `archive.db` — tracks `last_forgetting_run` as an ISO timestamp.
+
+**New functions in `scheduler.py`:**
+- `_is_overdue(db)` — checks whether the time since `last_forgetting_run` exceeds the configured cycle length (default 1 week). Treats "never run" as overdue.
+- `run_startup_catchup()` — called once, at process startup, *before* the MCP server starts serving requests (wired into `main.py`). If the cycle is overdue, it runs immediately instead of waiting.
+- `start_scheduler()` — kept as a **secondary** mechanism: the live in-process weekly timer still runs for the less common case of a long-lived server process, but it's no longer the only thing that can trigger the cycle.
+
+This directly fixes 3.3: even a server process that only lives for a few minutes per session will now reliably run the forgetting cycle on whichever session happens to start after it becomes due, rather than requiring continuous uptime.
+
+### 4.4 Bug caught during v1.1 testing (and fixed before shipping)
+
+While testing the new auto-extraction rules, a real edge case surfaced: the initial implementation used a flat character-length cutoff (`len(text) < 20`) to decide whether a message was too trivial to store. Short Arabic sentences that are nonetheless complete and meaningful — e.g. `"تزوجت الشهر الماضي"` ("I got married last month," 19 characters, 3 words) — were being incorrectly skipped, silently dropping a maximum-significance emotional memory. This was caught by the test suite (Section 4.5) before release and fixed by switching to a word-count-based check (skip only if under 3 words *and* under the character threshold), which treats compact non-Latin-script sentences fairly.
+
+### 4.5 Testing performed for v1.1
+
+All fixes were verified with executable tests before being considered complete:
+- Auto-extraction correctly skips filler ("ok", "hi", "تمام") and correctly stores substantive messages in both English and Arabic.
+- Emotional-signal phrases in both languages correctly produce `emotional_weight = 1.0`.
+- Identity/preference phrases correctly raise importance above the default.
+- Generic-but-substantive messages correctly receive the default importance rather than being skipped or over-weighted.
+- `_is_overdue()` correctly reports `True` for a never-run system, `False` immediately after a run, and `True` again once the configured cycle length has elapsed.
+- `MemoryGateway.build_context()` returns the Fast Layer regardless of message content — confirming the "always present" guarantee actually holds in code, not just in documentation.
+- `MemoryGateway.auto_store_turn()` stores both the user's message and the assistant's reply automatically, with zero tool-call decisions involved — confirming the core problem raised by the user is now solved for Gateway-based integrations.
+
+---
+
+## 5. What Remains — Future Versions
+
+Each version below adds exactly **one layer or one capability**, per the original design constraint of never combining multiple additions in a single version. No version should introduce breaking changes to the existing MCP tool interface (`get_context`, `store_memory` keep working as-is; new tools are additive).
+
+---
+
+### v2 — Warm Layer
+
+**Purpose:** hold secondary, context-specific user attributes that are neither always-present (like the Fast Layer) nor buried in the full archive.
+
+**Must contain:**
+- Secondary personality details (traits that matter only in certain contexts)
+- Biographical facts: birthdate, location, occupation
+- Recurring-but-occasional patterns (e.g. "usually asks about gym progress on Mondays")
+- Context-specific preferences (e.g. "prefers terse code comments only in Python projects")
+
+**Behavior to implement:**
+- Stored separately from both the Fast Layer (JSON) and the Archive (SQLite) — likely its own lightweight table or JSON structure, since it needs faster retrieval than the full semantic archive but shouldn't bloat the always-loaded Fast Layer.
+- Triggered by **semantic relevance** to the incoming message, not injected on every turn.
+- Retrieval must be noticeably faster than the Archive's full semantic search — this layer is meant to behave like "what you remember about a friend within the first few seconds of seeing them," so a lighter-weight matching mechanism (e.g. smaller embedding index, or keyword+tag matching first, semantic search as fallback) is appropriate.
+
+**New/changed interface:**
+- `get_context` should be extended to optionally include a `warm_layer` block in its response, populated only when relevant.
+- Consider a new tool: `update_warm_attribute(key, value)` for explicit updates, separate from the general `store_memory` archive tool.
+
+**Testing checklist for v2:**
+- Warm attributes are retrieved only when contextually relevant, not on every message.
+- Warm Layer retrieval is measurably faster than full Archive search.
+- Fast Layer remains untouched and unaffected by Warm Layer additions.
+
+---
+
+### v3 — Task Layer
+
+**Purpose:** replicate how humans hold one active project "in focus" while other projects remain suspended but recoverable.
+
+**Must contain:**
+- A single "active task" concept — only one task is active at a time.
+- Per-task context: recent decisions, current focus, file references, open questions.
+- A suspend/resume mechanism: switching tasks compresses the current task's state into storage and loads the new task's compressed state back into working context.
+
+**Behavior to implement:**
+- New storage structure (likely its own SQLite table or JSON store) keyed by `task_id`.
+- The Fast Layer's existing `active_task_id` field (already present in v1's data model) becomes functional — this is the field to update whenever a task switch occurs.
+- Task compression logic: when suspending a task, produce a short structured summary (decisions made, next step, open questions) rather than storing the full raw history — mirroring how a human recalls "the structure and last decision" of a project after being away, not every detail.
+- Optional: integration hook for external tools like Graphify for code projects, as mentioned in the original spec — this should be an optional adapter, not a hard dependency.
+
+**New/changed interface:**
+- Implement the `set_active_task(task_id)` tool exactly as originally scoped: suspends the current task, activates the requested one, returns the new `TaskContext`.
+- `get_context` should include the active task's compressed state automatically, without requiring a separate call.
+
+**Testing checklist for v3:**
+- Switching away from and back to a task correctly restores its compressed state.
+- Only one task is ever "active" at a time; suspended tasks are excluded from the Fast Layer's default context.
+- Task switching does not lose data — compression must be lossy only in *detail*, not in *structure* (decisions, next steps, and open questions must survive).
+
+---
+
+### v4 — LLM-Based Retrieval Judgment
+
+**Purpose:** complete the two-step retrieval decision logic originally specified. v1 only implemented Step 1 (keyword triggers); v4 adds Step 2.
+
+**Must contain:**
+- A fallback judgment call, used **only** when Step 1 (keyword/tag triggers) is ambiguous or returns no match but the message still might benefit from memory.
+- The judgment call should use a small, fast model — explicitly *not* the main conversational model — to keep latency and cost low. This should be configurable (model name/endpoint) rather than hardcoded, to preserve model-agnosticism.
+- Prompt should be minimal and binary: "Does answering this message require information from past conversations? Answer yes or no."
+
+**Behavior to implement:**
+- Extend `RetrievalEngine.should_retrieve()` with a second-stage check that only fires when Step 1 returns `False`.
+- Add a timeout/fallback: if the judgment call fails or the small model is unavailable, default to `False` (no retrieval) rather than blocking the main response — this preserves the "graceful degradation" constraint from the original spec.
+- Log or expose which step triggered retrieval (keyword vs. LLM judgment) for debugging and future tuning.
+
+**New/changed interface:**
+- No new MCP tools required — this is an internal enhancement to `get_context`'s existing decision logic.
+- `config.py` should gain settings for the judgment model endpoint/name and a timeout value.
+
+**Testing checklist for v4:**
+- Messages that Step 1 misses but clearly need memory (e.g. subtle references without explicit "last time" phrasing) are now caught.
+- Judgment-call failures do not crash or hang `get_context` — degrade gracefully to no-retrieval.
+- Latency overhead of the added judgment call is measured and stays within an acceptable bound (should be documented once implemented).
+
+---
+
+### v5 — AI Internal Thought Memory
+
+**Purpose:** allow the AI to remember not just what was *said*, but what it was *thinking* — reasoning steps, uncertainties, tentative conclusions — so it can genuinely continue a line of reasoning across sessions instead of reconstructing it from conversation history alone.
+
+**Must contain:**
+- Full use of the `source` field already present in v1's `MemoryEntry` model (`user`, `assistant_speech`, `assistant_thought`) — v1 defined this field but v5 is where `assistant_thought` entries actually get populated and used meaningfully.
+- A mechanism for the AI to explicitly log intermediate reasoning as its own memory type, separate from what it says to the user.
+
+**Behavior to implement:**
+- `store_memory` already accepts a `source` parameter — v5 should add clear guidance/prompting (in the MCP server's `instructions` field or tool docstring) encouraging the calling AI to use `assistant_thought` for reasoning it wants to preserve.
+- Retrieval logic may need a `source` filter option, so `get_context` (or a new dedicated call) can retrieve only prior reasoning when the AI is resuming a complex, unfinished thought process.
+- Consider whether internal thoughts should have different default importance/decay behavior than user-facing content — reasoning that led nowhere may deserve faster forgetting than reasoning that produced a firm conclusion.
+
+**New/changed interface:**
+- Possibly a new tool: `get_thought_history(task_id or topic)` — dedicated retrieval for prior reasoning, separate from general memory search.
+- `get_context` response could optionally include a `prior_reasoning` block.
+
+**Testing checklist for v5:**
+- Assistant-authored reasoning is stored distinctly from assistant-authored speech and from user statements.
+- A multi-session task can be resumed with the AI's prior reasoning intact, not just the conversation transcript.
+- Internal thoughts do not leak into contexts where they'd be inappropriate (e.g. should not be casually surfaced in `get_context` results the same way user facts are).
+
+---
+
+### v6 — Topic-Switching Buffer
+
+**Purpose:** maintain focus on a newly introduced topic within a single ongoing conversation, without fully losing track of the topic that was just abandoned — mirroring short-term human attention shifts.
+
+**Must contain:**
+- A rolling **Working Memory Buffer**, scoped to the current conversation only (distinct from the persistent Archive):
+
+```json
+{
+  "current_topic": {
+    "summary": "Designing the archive retrieval logic",
+    "depth": "full context"
+  },
+  "previous_topics": [
+    {"summary": "Discussed task layer switching", "depth": "compressed"},
+    {"summary": "Defined importance scoring formula", "depth": "compressed"}
+  ]
+}
+```
+
+**Behavior to implement:**
+- On each new message, detect whether the topic has shifted (this may reuse or extend the keyword-trigger and/or LLM-judgment mechanisms already built in v1/v4).
+- When a shift is detected, compress the outgoing topic to 1–2 sentences and push it into `previous_topics`; the new topic becomes `current_topic` with full depth.
+- If the user returns to a previous topic, first check the in-memory buffer (fast path); only fall back to a full Archive semantic search if the buffer has already been flushed (e.g. conversation ended or buffer size limit exceeded).
+
+**New/changed interface:**
+- This buffer is likely conversation-scoped and lightweight — it may not need to be a new MCP tool at all, but rather logic living in `get_context`'s internal state for the duration of a session. Needs a design decision: should the buffer persist across sessions (stored) or reset each new conversation (ephemeral)? The original spec implies it's conversation-scoped, so ephemeral-by-default with optional archival on flush is the most faithful interpretation.
+
+**Testing checklist for v6:**
+- Returning to a topic discussed earlier in the *same* conversation is fast (buffer hit) rather than requiring a full Archive search.
+- Compression of an abandoned topic preserves enough meaning that re-expansion (or archive fallback) still makes sense to the user.
+- Buffer size/limits are enforced so this doesn't grow unbounded within a very long conversation.
+
+---
+
+## 6. Summary Table
+
+| Version | Adds | Depends on | New MCP tools |
+|---|---|---|---|
+| v1 ✅ | Fast Layer, Archive, keyword retrieval, forgetting | — | `get_context`, `store_memory` |
+| v1.1 ✅ | Multilingual embeddings, forgetting-cycle startup catch-up, deterministic Gateway + rule-based auto-extraction | v1 | none new (Gateway is a library, not an MCP tool) |
+| v2 | Warm Layer | v1 Fast Layer, Archive | `update_warm_attribute` (proposed) |
+| v3 | Task Layer | v1 Fast Layer (`active_task_id`) | `set_active_task` |
+| v4 | LLM-based retrieval judgment | v1 retrieval logic | none (internal) |
+| v5 | AI internal thought memory | v1 `MemoryEntry.source` field | `get_thought_history` (proposed) |
+| v6 | Topic-switching buffer | v1/v4 retrieval logic | none (internal, conversation-scoped) |
+
+**Open items not yet addressed by v1.1** (see Section 3): keyword-only retrieval triggers still under-fire/over-fire (3.5, intentionally deferred to v4 per the original spec), and there is still no conflict/duplicate detection for contradicting stored facts (3.6, not yet scheduled to a specific version — candidate for a future v7).
+
+---
+
+## 7. Immediate Next Step
+
+v1.1's fixes were verified with unit/integration tests (Section 4.5), but — same limitation as v1 — could not be verified against a live embedding-model download in the current sandbox (Hugging Face is not reachable here). Before starting v2:
+
+1. Install dependencies and start `main.py` locally to confirm the new multilingual embedding model (`paraphrase-multilingual-MiniLM-L12-v2`) downloads and loads correctly.
+2. Connect the MCP server to a real client (Claude Desktop or Claude Code) and confirm the strengthened `instructions` text actually results in more consistent `get_context` calls in practice.
+3. If a custom API wrapper is planned (OpenAI/Gemini/direct Claude API), integrate `memory/gateway.py` per the updated README and confirm `process_turn()` behaves as expected against the real model.
+4. Run one full real-world loop against Arabic input specifically: a message like "تزوجت الشهر الماضي" should be captured with `emotional_weight = 1.0` and later retrieved correctly when referenced again.
+5. Manually verify the startup catch-up: delete or backdate the `last_forgetting_run` state in `archive.db`, restart `main.py`, and confirm the forgetting cycle runs immediately at startup rather than waiting.
+6. Only after these are confirmed working should Warm Layer (v2) development begin.

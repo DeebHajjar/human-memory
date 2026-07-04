@@ -1,0 +1,15 @@
+# Human Memory System v1.1 — Python dependencies
+# Install: pip install -r requirements.txt
+# Requires Python >= 3.10
+
+# MCP server framework
+mcp>=1.0.0
+
+# Local embedding model (multilingual, ~470 MB, downloaded once on first run)
+sentence-transformers>=2.7.0
+
+# Numerical operations for cosine similarity
+numpy>=1.24.0
+
+# Background scheduler (forgetting cycle: startup catch-up + weekly timer)
+APScheduler>=3.10.0
