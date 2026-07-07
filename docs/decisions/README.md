@@ -13,3 +13,4 @@ If a decision is later reversed or replaced, a new ADR is added noting it supers
 | [005](ADR-005-multilingual-embeddings.md) | Multilingual embeddings, not English-only | Accepted |
 | [006](ADR-006-forgetting-cycle-startup-catchup.md) | Forgetting-cycle catch-up on startup, not only a live timer | Accepted |
 | [007](ADR-007-archive-not-delete-superseded-facts.md) | Superseded facts are archived, not deleted | Accepted — not yet implemented (v7) |
+| [008](ADR-008-warm-layer-dual-routing-and-upsert.md) | Warm Layer uses upsert semantics but dual-routes to Archive | Accepted |

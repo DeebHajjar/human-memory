@@ -1,6 +1,6 @@
 # Architecture
 
-*Human Memory System — v1.1*
+*Human Memory System — v2*
 
 This document describes the overall design of the system: the layers, how data flows through them, and how the pieces fit together. For *why* specific choices were made, see `decisions/` (one ADR per decision). For version-by-version history, see `changelog.md`. For what's planned next, see `roadmap.md`.
 
@@ -63,7 +63,7 @@ Only two of these are implemented (v1/v1.1); the other two are specified but not
 | Layer | Status | What it holds | Loaded |
 |---|---|---|---|
 | **Fast Layer** | ✅ Built | Core identity: name, age, language, personality traits, key preferences, values, active task id | Always, every request |
-| **Warm Layer** | 🔲 Planned (v2) | Secondary attributes: birthdate, location, occupation, context-specific preferences | On semantic relevance, faster than Archive |
+| **Warm Layer** | ✅ Built (v2) | Secondary attributes: birthdate, location, occupation, recurring habits, context-specific preferences | On semantic relevance, faster than Archive |
 | **Task Layer** | 🔲 Planned (v3) | One active project's working state: recent decisions, focus, open questions | On task switch |
 | **Archive** | ✅ Built | All past conversations/facts, SQLite + local embeddings | On retrieval trigger only |
 
@@ -71,11 +71,17 @@ Only two of these are implemented (v1/v1.1); the other two are specified but not
 
 A single JSON file (`data/fast_layer.json`), read and written by `memory/fast_layer.py`. Intentionally small and human-editable — someone can open the file directly and correct it. Never searched; always loaded whole.
 
-### 3.2 Archive
+### 3.2 Warm Layer (v2)
+
+A `warm_layer` table in `data/archive.db`, managed by `memory/warm_layer.py`. Each row is one `WarmAttribute`: a `key` (semantic category), `value` (full text), `context_hint` (when to surface it), `embedding` (384-dim BLOB), `importance`, and `last_updated`.
+
+Unlike the Archive (which appends entries), the Warm Layer uses **upsert semantics**: storing a new `location` value replaces the old one — no duplicate "I live in Dubai" + "I live in London" conflict. Two-pass retrieval: keyword match on `context_hint` first (fast path), then cosine similarity for remaining candidates. Threshold is 0.45 (vs Archive's 0.30) because warm attributes are specific stable facts where false positives are costly.
+
+### 3.3 Archive
 
 A local SQLite database (`data/archive.db`), managed by `memory/archive.py`. Each row is one `MemoryEntry`: content, an optional compressed summary, a 384-dimension embedding stored as a BLOB, and a set of scores (`importance_score`, `frequency_score`, `recency_score`, `emotional_weight`) plus metadata (`tags`, `source`, `timestamp`, `last_accessed`, `access_count`).
 
-A second table, `system_state` (added in v1.1), stores simple key/value bookkeeping — currently just `last_forgetting_run` — decoupled from the memory entries themselves.
+A second table, `system_state` (added in v1.1), stores simple key/value bookkeeping — currently just `last_forgetting_run`. A third table, `warm_layer` (added in v2), is the Warm Layer described above — same file, separate concern.
 
 ---
 
@@ -111,12 +117,14 @@ incoming message
       ▼
 Fast Layer always loaded (FastLayerManager.load())
       │
-      ▼
-Step 1 — keyword trigger check (RetrievalEngine.should_retrieve())
-  • time/context reference phrases (bilingual EN/AR)
-  • known-tag word match
-      │
-      ├── no match ──────────────────────────► return Fast Layer only
+      ├──────────────────────────────────────────────────────────┐
+      │                                                           │
+      ▼ (always)                                                 ▼ (always, v2)
+Step 1 — keyword trigger check (RetrievalEngine.should_retrieve()) Warm Layer retrieval (WarmLayerManager.retrieve_relevant())
+  • time/context reference phrases (bilingual EN/AR)              • keyword match on context_hint (fast path)
+  • known-tag word match                                          • cosine similarity on embeddings (fallback)
+      │                                                           • threshold: 0.45
+      ├── no match ──────────────────────────► return Fast Layer + warm_attributes
       │
       ▼ match
 Step 2 — semantic search (RetrievalEngine.retrieve())
@@ -126,7 +134,7 @@ Step 2 — semantic search (RetrievalEngine.retrieve())
   • top_k results above threshold, access stats updated
       │
       ▼
-return Fast Layer + retrieved memories
+return Fast Layer + warm_attributes + retrieved memories
 ```
 
 Step 2's "LLM judgment" fallback described in the original spec is intentionally not built yet — that's v4 (see `roadmap.md`).
@@ -184,21 +192,23 @@ A secondary live weekly timer (`scheduler.start_scheduler()`) also runs for the 
 
 ```
 human-memory-system/
-├── config.py              Constants: paths, model name, scoring weights, thresholds
+├── config.py              Constants: paths, model name, scoring weights, thresholds (v2 adds Warm Layer constants)
 ├── main.py                Entry point: startup catch-up → scheduler → MCP server
-├── mcp_server.py           MCP tools: get_context, store_memory (passive, protocol-driven)
+├── mcp_server.py           MCP tools: get_context, store_memory, update_warm_attribute (v2)
 ├── scheduler.py            Forgetting-cycle catch-up + secondary live timer
 ├── data/
 │   ├── fast_layer.json     Human-editable core identity
-│   └── archive.db          SQLite: memories table + system_state table
+│   └── archive.db          SQLite: memories table + system_state table + warm_layer table (v2)
 └── memory/
-    ├── models.py           MemoryEntry, FastLayer, LayeredContext dataclasses
+    ├── models.py           MemoryEntry, FastLayer, WarmAttribute (v2), LayeredContext dataclasses
     ├── fast_layer.py        Read/write fast_layer.json
     ├── archive.py           SQLite operations, embedding storage, system_state
+    ├── warm_layer.py        WarmLayerManager — upsert + two-pass retrieval (v2)
     ├── retrieval.py         Keyword triggers + semantic search
     ├── forgetting.py        Importance scoring + pruning logic
-    ├── auto_extract.py      Rule-based storage-worthiness/importance/tag extraction
-    └── gateway.py            MemoryGateway — deterministic wrapper for direct API use
+    ├── auto_extract.py      Pluggable Rule Engine: FillerSkipRule, IdentitySignalRule,
+    │                         EmotionalSignalRule, WarmAttributeRule (v2)
+    └── gateway.py            MemoryGateway — deterministic wrapper for direct API use (v2 updated)
 ```
 
 ---
@@ -207,11 +217,10 @@ human-memory-system/
 
 Per the roadmap (`roadmap.md`), the following are specified but not built, and nothing above should be read as already supporting them:
 
-- **Warm Layer** (v2) — no semantic-relevance-triggered secondary-attribute store exists yet; `active_task_id` in the Fast Layer is a placeholder field with no Task Layer behind it.
+- **Task Layer** (v3) — no active-task suspend/resume exists yet; `active_task_id` in the Fast Layer is a placeholder field.
 - **LLM-based retrieval judgment** (v4) — retrieval is keyword-trigger-only; there is no fallback model call when Step 1 is ambiguous.
 - **Vector index (FAISS/HNSW)** — retrieval is a linear scan over all embeddings. See `PROJECT_STATUS.md` §5 for the migration trigger conditions; nothing is built yet.
-- **Consistency/contradiction handling** (v7) — the archive has no notion of a fact being superseded or duplicated; every stored entry is permanent until the forgetting system prunes it on its own schedule.
-- **Pluggable rule engine** — `memory/auto_extract.py` is currently a flat set of regex pattern lists, not the Rule-object plugin architecture described in `PROJECT_STATUS.md` §4.6. This refactor is planned before v2's Warm Layer detection logic is added.
+- **Consistency/contradiction handling** (v7) — the archive has no notion of a fact being superseded or duplicated; every stored entry is permanent until the forgetting system prunes it on its own schedule. Note: the Warm Layer's upsert semantics partially solve this for stable biographical facts (location, occupation, etc.), but general contradiction detection is still v7.
 
 ---
 

@@ -138,7 +138,45 @@ Format per experiment: **Question → Method → Result → Conclusion**.
 
 ---
 
-## Known gaps — not yet tested (as of v1.1)
+## v2 — Warm Layer
+
+### E13: Does the Rule Engine refactor preserve existing extraction behavior?
+
+**Question:** does `auto_extract.py` behave exactly the same after refactoring into `Rule` classes? Do all v1.1 extraction tests still pass? And does the new high-signal exemption work?
+
+**Method:** ported all v1.1 cases from E6 into a new test script (`test_phase0.py`). Added a test for the high-signal exemption (e.g. "اسمي ديب"). Tested new `extract_warm()` against expected EN/AR inputs (location, occupation).
+
+**Result:** all original assertions passed. The new high-signal exemption correctly caught and preserved "اسمي ديب" which was previously at risk of being skipped by `FillerSkipRule`. `extract_warm()` accurately detected warm attributes and auto-generated `context_hint`. Dual extraction (where a warm attribute also returns an `ExtractedFact` for archiving) worked as expected.
+
+**Conclusion:** the Rule Engine (`ADR-004`) successfully decoupled the logic without breaking the baseline.
+
+---
+
+### E14: Does Warm Layer storage implement upsert correctly?
+
+**Question:** does `WarmLayerManager.upsert()` correctly replace old values instead of duplicating them? Does it leave the Fast Layer untouched?
+
+**Method:** tested via `test_phase12.py`. Inserted "I live in Dubai" under key `location`. Checked retrieval. Then upserted "I moved to London" under key `location`. Checked retrieval. Checked if `fast_layer.json` was modified.
+
+**Result:** the second upsert successfully overwrote the first (no duplicate keys). `fast_layer.json` was untouched.
+
+**Conclusion:** Upsert semantics (`ADR-008`) work as specified for the Warm Layer table.
+
+---
+
+### E15: Does two-pass retrieval work without embeddings for keyword matches?
+
+**Question:** does `WarmLayerManager.retrieve_relevant()` correctly return matches based purely on `context_hint` keywords, even without a query embedding?
+
+**Method:** tested via `test_phase12.py`. Passed `query_embedding=None` with the message "I want to talk about travel".
+
+**Result:** it correctly matched the `context_hint` "when discussing travel" and returned the `location` attribute without running cosine similarity.
+
+**Conclusion:** the fast path of the two-pass retrieval is functional.
+
+---
+
+## Known gaps — not yet tested (as of v2)
 
 These are explicitly *not* claims of failure — they simply have not been run yet, mostly due to the development sandbox lacking internet access to Hugging Face for the embedding model download. Recorded here so they aren't lost, and so `roadmap.md`'s "immediate next step" items map directly back to specific open experiments.
 

@@ -11,22 +11,27 @@ This is the condensed, actionable view of where the project is and what's next. 
 
 ## Where we are now
 
-**v1.1 — shipped.** Fast Layer, Archive, keyword-only retrieval, forgetting system, MCP server, plus three v1.1 reliability fixes: multilingual embeddings, forgetting-cycle startup catch-up, and a deterministic Gateway with rule-based auto-extraction.
+**v2 — shipped.** Fast Layer, Archive, keyword-only retrieval, forgetting system, MCP server, multilingual embeddings, forgetting-cycle startup catch-up, deterministic Gateway with rule-based auto-extraction (v1/v1.1 baseline), plus:
+- **Warm Layer** (v2): `memory/warm_layer.py` (`WarmLayerManager`), `warm_layer` table in `archive.db`, upsert semantics, two-pass retrieval (keyword + cosine similarity, threshold 0.45).
+- **Pluggable Rule Engine** (v2 prerequisite): `memory/auto_extract.py` refactored into `FillerSkipRule`, `IdentitySignalRule`, `EmotionalSignalRule`, `WarmAttributeRule` — ADR-004 implemented.
+- **`update_warm_attribute` MCP tool** (v2): explicit Warm Layer management alongside the auto-detection path.
+- **`extract_warm()` API** (v2): dual routing in `gateway.py` — warm candidates upsert into Warm Layer AND are also archived for long-term history.
 
-**Not yet verified against a live environment** (blocked on sandbox network access — see `experiments.md` E9–E12): real embedding-model download, live MCP client integration, real-world Arabic round-trip, and a real retrieval-latency baseline.
+**Not yet verified against a live environment** (blocked on sandbox network access — see `experiments.md` E9–E12 + v2 additions): real embedding-model download, live MCP client integration, real-world Arabic round-trip, Warm Layer end-to-end retrieval with a real embedder.
 
 ---
 
 ## Immediate next step (before any new version work starts)
 
-These come directly from `PROJECT_STATUS.md` §8 and `experiments.md`'s "Known gaps" — nothing new should be built until these are confirmed:
+These come directly from `PROJECT_STATUS.md` and `experiments.md` — nothing new should be built until these are confirmed:
 
 1. Run `main.py` on a machine with real internet access; confirm `paraphrase-multilingual-MiniLM-L12-v2` downloads and loads. *(closes E9)*
-2. Connect to a real MCP client (Claude Desktop/Code); observe whether the strengthened `instructions` text results in consistent `get_context` calls in practice. *(closes E10)*
-3. If a custom API wrapper is planned, integrate `memory/gateway.py` and confirm `process_turn()` against a real model.
-4. Run a real Arabic round-trip: store "تزوجت الشهر الماضي", confirm `emotional_weight = 1.0`, confirm later retrieval works. *(closes E11)*
+2. Connect to a real MCP client (Claude Desktop/Code); observe whether `get_context` is called consistently, and whether `warm_attributes` appear in the response correctly. *(closes E10)*
+3. If a custom API wrapper is planned, integrate `memory/gateway.py` and confirm `process_turn()` against a real model, including Warm Layer upserts.
+4. Run a real Arabic round-trip with Warm Layer: store "أعيش في دبي" (I live in Dubai), confirm it upserts `location`, confirm later retrieval works. *(closes E11 + v2 warm round-trip)*
 5. Manually verify startup catch-up: backdate `last_forgetting_run` in `archive.db`, restart, confirm the cycle runs immediately.
-6. Collect a first real retrieval-latency measurement once the archive has realistic content in it. *(closes E12 — this number matters for Section "Performance & Scalability" below.)*
+6. Test `update_warm_attribute` MCP tool via a real client — confirm the `warm_layer` table is updated and the attribute appears in the next `get_context` response.
+7. Collect a first real retrieval-latency measurement: Warm Layer retrieval should be measurably faster than Archive retrieval. *(closes E12 and provides v2 latency baseline)*
 
 ---
 
@@ -42,8 +47,7 @@ Each version adds exactly one capability. No version breaks the existing `get_co
 
 | # | Version | Adds | New MCP tools |
 |---|---|---|---|
-| — | *(prerequisite)* | Pluggable rule engine refactor | none |
-| v2 | **Warm Layer** | Secondary attributes (biography, context-specific preferences), retrieved on semantic relevance, faster than full Archive search | `update_warm_attribute` (proposed) |
+| v2 | **Warm Layer** ✅ shipped | Secondary attributes (biography, context-specific preferences), retrieved on semantic relevance, faster than full Archive search | `update_warm_attribute` |
 | v3 | **Task Layer** | One active project's working state; suspend/resume with compressed state | `set_active_task` |
 | v4 | **LLM-based retrieval judgment** | Step 2 of the original two-step retrieval decision (small/fast model, binary yes/no, graceful fallback) | none (internal) |
 | v5 | **AI internal thought memory** | `assistant_thought` source populated and retrievable; AI can resume its own prior reasoning | `get_thought_history` (proposed) |
@@ -56,14 +60,18 @@ Each version adds exactly one capability. No version breaks the existing `get_co
 - Archive exceeds **~20,000–50,000 entries**, **or**
 - Measured p95 retrieval latency exceeds **~150ms**
 
-Whichever comes first. SQLite stays the source of truth; the index becomes a rebuildable cache alongside it. Revisit only once real usage data exists (this is what step 6 above starts collecting). Full detail in `PROJECT_STATUS.md` §5.
+Whichever comes first. SQLite stays the source of truth; the index becomes a rebuildable cache alongside it. Revisit only once real usage data exists. The Warm Layer is exempt from this trigger — its table is expected to stay under 100 rows and is already fast enough for linear scan.
 
 ---
 
 ## Version details (condensed)
 
-### v2 — Warm Layer
-Secondary, context-specific attributes (birthdate, location, occupation, situational preferences) — not always-loaded like the Fast Layer, not buried in full semantic search like the Archive. Must be retrieved faster than Archive search. **Depends on:** the rule-engine refactor above.
+### v2 — Warm Layer ✅ (shipped)
+- `memory/warm_layer.py`: `WarmLayerManager` with upsert semantics and two-pass retrieval.
+- `memory/auto_extract.py`: refactored to pluggable Rule Engine; `WarmAttributeRule` added (EN+AR patterns for location, occupation, birthdate, education, recurring_habit, language_preference).
+- `memory/models.py`: `WarmAttribute` dataclass; `LayeredContext` extended with `warm_attributes` + `warm_retrieval_triggered`.
+- `memory/gateway.py`: `build_context()` queries Warm Layer; `auto_store_turn()` routes warm candidates to upsert via `extract_warm()`.
+- `mcp_server.py`: `get_context` response includes `warm_attributes`; new `update_warm_attribute` tool added.
 
 ### v3 — Task Layer
 One active task at a time; switching suspends the current task's compressed state and loads another's. Makes the Fast Layer's existing (currently unused) `active_task_id` field functional. Optional adapter for external tools like Graphify — not a hard dependency.

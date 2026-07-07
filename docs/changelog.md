@@ -6,6 +6,31 @@ Condensed, scannable diff between versions. For the full reasoning behind any ch
 
 ---
 
+## v2
+
+**Theme:** secondary context (Warm Layer) + extraction refactor (pluggable rule engine).
+
+### Added
+- `memory/warm_layer.py` — new `WarmLayerManager` class. Manages the `warm_layer` SQLite table with upsert semantics and two-pass retrieval (keyword match on `context_hint` -> cosine similarity fallback).
+- `memory/models.py`: `WarmAttribute` dataclass added. `LayeredContext` now includes `warm_attributes` and `warm_retrieval_triggered`.
+- `mcp_server.py`: added `update_warm_attribute` tool for explicit Warm Layer management.
+- `config.py`: added `WARM_LAYER_TOP_K` (5), `WARM_LAYER_SCORE_THRESHOLD` (0.45), `WARM_LAYER_SIM_WEIGHT` (0.7), and `WARM_LAYER_IMP_WEIGHT` (0.3).
+- `memory/auto_extract.py`: added `extract_warm()` to support auto-detecting warm candidates. Added `WarmAttributeRule` (detects location, occupation, birthdate, education, recurring_habit, language_preference in EN and AR).
+- `docs/decisions/ADR-008-warm-layer-dual-routing-and-upsert.md` — documents the architectural decision to use upsert for current state but dual-route to the Archive for historical record.
+
+### Changed
+- `memory/auto_extract.py` — refactored from a flat pattern-list into a pluggable `Rule` engine architecture (implementing `ADR-004`). Includes `FillerSkipRule`, `IdentitySignalRule`, `EmotionalSignalRule`, and `WarmAttributeRule`.
+- `memory/gateway.py`: `build_context()` now queries the Warm Layer and includes it in `LayeredContext`. `auto_store_turn()` now dual-routes warm candidates to both the Warm Layer (upsert) and the Archive (append).
+- `mcp_server.py`: `get_context` now includes `warm_attributes` in its JSON response. It also opportunistically auto-upserts warm attributes on the user message.
+
+### Fixed
+- **Bug found during Rule Engine refactoring:** The `FillerSkipRule` in v1.1 exempted text based on word/character count, but could still incorrectly skip extremely short, high-signal phrases like "اسمي ديب" (My name is Deeb - 2 words). Fixed by explicitly exempting any text that matches a high-signal identity or emotional pattern from the length check.
+
+### Documented (not yet implemented)
+- `docs/decisions/ADR-007-archive-not-delete-superseded-facts.md` added (previously discussed in `PROJECT_STATUS.md` §3.6 and §6, formalized now as a planned decision for v7 Memory Consistency).
+
+---
+
 ## v1.1
 
 **Theme:** reliability fixes — three structural gaps found in v1 during evaluation, fixed before any new feature work.

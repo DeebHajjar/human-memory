@@ -1,6 +1,6 @@
 # Human Memory System — Project Status & Roadmap
 
-*Last updated: July 2026 — v1.1*
+*Last updated: July 2026 — v2*
 
 ---
 
@@ -12,7 +12,8 @@ This document describes:
 - What was built and verified in **v1** (Section 2)
 - A full evaluation of v1, including where it fails in real-world use (Section 3)
 - What was fixed in **v1.1** to address those failures, and how (Section 4)
-- What each future version (**v2 → v6**) must add, in detail (Section 5)
+- What was added in **v2** (Warm Layer) (Section 5)
+- What each future version (**v3 → v6**) must add, in detail (Section 6)
 
 ---
 
@@ -237,37 +238,54 @@ All fixes were verified with executable tests before being considered complete:
 
 ---
 
-## 5. What Remains — Future Versions
+## 5. What Was Built — v2
+
+v2 implements the **Warm Layer**, along with its required prerequisite (the Pluggable Rule Engine, `ADR-004`).
+
+### 5.1 Pluggable Rule Engine (v2 Prerequisite)
+
+**Changed file: `memory/auto_extract.py`**
+The extraction logic was refactored into a `Rule` object architecture. It now iterates over `FillerSkipRule`, `IdentitySignalRule`, `EmotionalSignalRule`, and the new `WarmAttributeRule`. This replaced the flat pattern lists and made the engine cleanly extensible.
+
+**High-signal exemption fix:** During refactoring, we addressed a remaining edge case in `FillerSkipRule` where even a 2-word phrase might be skipped, by exempting any text that matches a high-signal identity or emotional pattern (e.g. "اسمي ديب").
+
+### 5.2 The Warm Layer
+
+**New file: `memory/warm_layer.py`**
+The Warm Layer holds secondary, context-specific biographical attributes (e.g. location, occupation, recurring habits). It is stored in a `warm_layer` table inside `archive.db`.
+
+**Upsert semantics and Dual Routing (`ADR-008`):**
+Unlike the Archive, the Warm Layer uses **upsert semantics**. Storing a new value for a key (like "location") completely replaces the old one. This prevents contradictory current facts from being surfaced simultaneously.
+To ensure the historical record is not lost, `MemoryGateway` implements **dual routing**: when `extract_warm()` matches a biographical fact, it is upserted into the Warm Layer *and* also appended to the Archive.
+
+**Two-Pass Retrieval:**
+Retrieval (`WarmLayerManager.retrieve_relevant()`) is faster than a full Archive search:
+1. Keyword match on the `context_hint` field (fast path).
+2. Cosine similarity on embeddings for remaining candidates.
+The score threshold is `0.45` (higher than the Archive's `0.30`) to avoid false positives on highly specific biographical facts.
+
+### 5.3 MCP & Gateway Integration
+
+- `memory/gateway.py`: `build_context()` now queries the Warm Layer and includes `warm_attributes` in the context block. `auto_store_turn()` routes candidates appropriately using the new dual routing logic.
+- `mcp_server.py`: `get_context` now opportunistically auto-upserts warm attributes on top of archiving them. A new explicit `update_warm_attribute` tool was added for MCP clients to explicitly manage these stable personal facts.
+
+### 5.4 Testing performed for v2
+
+- `FillerSkipRule` exemption verified: "اسمي ديب" is retained despite being 2 words.
+- All 6 `WarmAttributeRule` categories (location, occupation, birthdate, education, recurring_habit, language_preference) trigger correctly in EN and AR.
+- `WarmLayerManager.upsert()` correctly replaces existing keys instead of duplicating.
+- `WarmLayerManager.retrieve_relevant()` correctly handles both keyword and semantic retrieval passes.
+- Verified that Warm Layer operations do not corrupt the Fast Layer JSON.
+
+---
+
+## 6. What Remains — Future Versions
 
 Each version below adds exactly **one layer or one capability**, per the original design constraint of never combining multiple additions in a single version. No version should introduce breaking changes to the existing MCP tool interface (`get_context`, `store_memory` keep working as-is; new tools are additive).
 
 ---
 
-### v2 — Warm Layer
 
-**Purpose:** hold secondary, context-specific user attributes that are neither always-present (like the Fast Layer) nor buried in the full archive.
-
-**Must contain:**
-- Secondary personality details (traits that matter only in certain contexts)
-- Biographical facts: birthdate, location, occupation
-- Recurring-but-occasional patterns (e.g. "usually asks about gym progress on Mondays")
-- Context-specific preferences (e.g. "prefers terse code comments only in Python projects")
-
-**Behavior to implement:**
-- Stored separately from both the Fast Layer (JSON) and the Archive (SQLite) — likely its own lightweight table or JSON structure, since it needs faster retrieval than the full semantic archive but shouldn't bloat the always-loaded Fast Layer.
-- Triggered by **semantic relevance** to the incoming message, not injected on every turn.
-- Retrieval must be noticeably faster than the Archive's full semantic search — this layer is meant to behave like "what you remember about a friend within the first few seconds of seeing them," so a lighter-weight matching mechanism (e.g. smaller embedding index, or keyword+tag matching first, semantic search as fallback) is appropriate.
-
-**New/changed interface:**
-- `get_context` should be extended to optionally include a `warm_layer` block in its response, populated only when relevant.
-- Consider a new tool: `update_warm_attribute(key, value)` for explicit updates, separate from the general `store_memory` archive tool.
-
-**Testing checklist for v2:**
-- Warm attributes are retrieved only when contextually relevant, not on every message.
-- Warm Layer retrieval is measurably faster than full Archive search.
-- Fast Layer remains untouched and unaffected by Warm Layer additions.
-
----
 
 ### v3 — Task Layer
 
@@ -379,29 +397,30 @@ Each version below adds exactly **one layer or one capability**, per the origina
 
 ---
 
-## 6. Summary Table
+## 7. Summary Table
 
 | Version | Adds | Depends on | New MCP tools |
 |---|---|---|---|
 | v1 ✅ | Fast Layer, Archive, keyword retrieval, forgetting | — | `get_context`, `store_memory` |
 | v1.1 ✅ | Multilingual embeddings, forgetting-cycle startup catch-up, deterministic Gateway + rule-based auto-extraction | v1 | none new (Gateway is a library, not an MCP tool) |
-| v2 | Warm Layer | v1 Fast Layer, Archive | `update_warm_attribute` (proposed) |
+| v2 ✅ | Warm Layer, two-pass retrieval, upsert semantics, pluggable rule engine | v1.1 | `update_warm_attribute` |
 | v3 | Task Layer | v1 Fast Layer (`active_task_id`) | `set_active_task` |
 | v4 | LLM-based retrieval judgment | v1 retrieval logic | none (internal) |
 | v5 | AI internal thought memory | v1 `MemoryEntry.source` field | `get_thought_history` (proposed) |
 | v6 | Topic-switching buffer | v1/v4 retrieval logic | none (internal, conversation-scoped) |
 
-**Open items not yet addressed by v1.1** (see Section 3): keyword-only retrieval triggers still under-fire/over-fire (3.5, intentionally deferred to v4 per the original spec), and there is still no conflict/duplicate detection for contradicting stored facts (3.6, not yet scheduled to a specific version — candidate for a future v7).
+**Open items not yet addressed by v2** (see Section 3): keyword-only retrieval triggers still under-fire/over-fire (3.5, intentionally deferred to v4 per the original spec), and there is still no conflict/duplicate detection for contradicting stored facts (3.6, not yet scheduled to a specific version — candidate for a future v7).
 
 ---
 
-## 7. Immediate Next Step
+## 8. Immediate Next Step
 
-v1.1's fixes were verified with unit/integration tests (Section 4.5), but — same limitation as v1 — could not be verified against a live embedding-model download in the current sandbox (Hugging Face is not reachable here). Before starting v2:
+v2's logic was verified with unit/integration tests (Section 5.4), but could not be verified against a live embedding-model download in the current sandbox (Hugging Face is not reachable here). Before starting v3:
 
 1. Install dependencies and start `main.py` locally to confirm the new multilingual embedding model (`paraphrase-multilingual-MiniLM-L12-v2`) downloads and loads correctly.
-2. Connect the MCP server to a real client (Claude Desktop or Claude Code) and confirm the strengthened `instructions` text actually results in more consistent `get_context` calls in practice.
-3. If a custom API wrapper is planned (OpenAI/Gemini/direct Claude API), integrate `memory/gateway.py` per the updated README and confirm `process_turn()` behaves as expected against the real model.
-4. Run one full real-world loop against Arabic input specifically: a message like "تزوجت الشهر الماضي" should be captured with `emotional_weight = 1.0` and later retrieved correctly when referenced again.
-5. Manually verify the startup catch-up: delete or backdate the `last_forgetting_run` state in `archive.db`, restart `main.py`, and confirm the forgetting cycle runs immediately at startup rather than waiting.
-6. Only after these are confirmed working should Warm Layer (v2) development begin.
+2. Connect the MCP server to a real client (Claude Desktop or Claude Code) and confirm `get_context` is called consistently and that `warm_attributes` appear in the response correctly.
+3. If a custom API wrapper is planned (OpenAI/Gemini/direct Claude API), integrate `memory/gateway.py` per the updated README and confirm `process_turn()` behaves as expected against the real model, including Warm Layer upserts.
+4. Run one full real-world loop against Arabic input specifically: store "أعيش في دبي" (I live in Dubai), confirm it upserts `location`, and confirm later retrieval works.
+5. Test `update_warm_attribute` MCP tool via a real client — confirm the `warm_layer` table is updated and the attribute appears in the next `get_context` response.
+6. Collect a first real retrieval-latency measurement: Warm Layer retrieval should be measurably faster than Archive retrieval.
+7. Only after these are confirmed working should Task Layer (v3) development begin.

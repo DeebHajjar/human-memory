@@ -1,5 +1,5 @@
 """
-Human Memory System — v1 Configuration
+Human Memory System — v2 Configuration
 All paths and tunable constants live here.
 """
 
@@ -64,3 +64,14 @@ AUTO_STORE_MIN_CHARS      = 20     # ignore trivially short exchanges
 AUTO_STORE_DEFAULT_IMPORTANCE = 0.4
 AUTO_STORE_HIGH_IMPORTANCE    = 0.7
 AUTO_STORE_EMOTIONAL_WEIGHT   = 1.0  # applied when a strong-signal phrase is found
+
+# ── Warm Layer (v2) ──────────────────────────────────────────────────────────
+#
+# Secondary biographical/preference attributes retrieved on semantic relevance.
+# Threshold is intentionally higher than Archive (0.45 vs 0.30): warm attributes
+# are specific stable facts, so false positives are worse than false negatives.
+
+WARM_LAYER_TOP_K              = 5
+WARM_LAYER_SCORE_THRESHOLD    = 0.45   # combined (similarity × 0.8 + importance × 0.2)
+WARM_LAYER_SIM_WEIGHT         = 0.8    # heavier similarity weight vs Archive's 0.7
+WARM_LAYER_IMP_WEIGHT         = 0.2

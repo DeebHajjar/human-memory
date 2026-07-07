@@ -17,7 +17,7 @@ Most AI assistants forget everything the moment a conversation ends. This system
 - **Forgets trivial details over time**, but protects emotionally significant memories permanently
 - **Integrates with any AI** via the standard MCP protocol, or via a direct API wrapper
 
-> **New in v1.1:** multilingual embeddings (Arabic + English), a reliability fix for the weekly forgetting cycle, and a new deterministic `Gateway` that guarantees memory is actually saved and injected on every turn for direct API integrations. See [`docs/changelog.md`](docs/changelog.md) for the full diff from v1.
+> **New in v2:** the Warm Layer! A fast, semantic-relevance-driven layer for context-specific biographical attributes (e.g. location, occupation) with upsert semantics to prevent contradictory current facts. Also includes a fully pluggable Rule Engine for auto-extraction. See [`docs/changelog.md`](docs/changelog.md) for the full diff from v1.1.
 
 ---
 
@@ -51,7 +51,7 @@ The system is organized into layers with different retrieval costs, mirroring ho
 |---|---|---|---|
 | **Fast Layer** | ✅ Built | Core identity: name, language, traits, preferences, values | Always, every request |
 | **Archive** | ✅ Built | All past conversations/facts — SQLite + local embeddings | Only when retrieval is triggered |
-| Warm Layer | 🔲 Planned | Secondary attributes (biography, context-specific preferences) | On semantic relevance |
+| **Warm Layer** | ✅ Built | Secondary attributes (biography, context-specific preferences) | On semantic relevance |
 | Task Layer | 🔲 Planned | One active project's working state | On task switch |
 
 Full detail on every layer, built and planned, lives in [`docs/architecture.md`](docs/architecture.md).
@@ -414,7 +414,7 @@ Documented honestly rather than hidden — see [`docs/decisions/`](docs/decision
 | Version | Adds |
 |---|---|
 | v1 / v1.1 ✅ | Fast Layer, Archive, keyword retrieval, forgetting, Gateway, multilingual embeddings |
-| v2 | Warm Layer — secondary attributes, retrieved on demand |
+| v2 ✅ | Warm Layer — secondary attributes, two-pass retrieval, upsert semantics |
 | v3 | Task Layer — one active task, switchable, persists state |
 | v4 | LLM-based retrieval judgment — replaces keyword-only trigger |
 | v5 | AI internal thought memory (`assistant_thought` source) |
