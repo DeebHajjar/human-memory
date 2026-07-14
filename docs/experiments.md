@@ -176,30 +176,60 @@ Format per experiment: **Question → Method → Result → Conclusion**.
 
 ---
 
-## Known gaps — not yet tested (as of v2)
+## Known gaps at v2 — since resolved by manual real-machine testing
 
-These are explicitly *not* claims of failure — they simply have not been run yet, mostly due to the development sandbox lacking internet access to Hugging Face for the embedding model download. Recorded here so they aren't lost, and so `roadmap.md`'s "immediate next step" items map directly back to specific open experiments.
+These were originally recorded as untested (mostly due to the development sandbox lacking internet access to Hugging Face for the embedding model download). All were subsequently run manually on a real machine and are now resolved — see below.
 
-### E9 (pending): Live embedding model download and load
+### E9 (✅ resolved — v2.1): Live embedding model download and load
 
 **Question:** does `paraphrase-multilingual-MiniLM-L12-v2` actually download and load correctly via `sentence-transformers` on a real machine with internet access?
 
-**Status:** blocked in the current environment (Hugging Face unreachable). All retrieval/storage logic has been tested with either no embedder or randomly generated fake embeddings standing in for real ones — the *decision logic* (should we retrieve, should we store, what score) is verified; the *embedding quality itself* is not.
+**Result:** confirmed working. The model downloaded and loaded successfully on the first real-machine run. The startup catch-up forgetting cycle also ran and completed successfully (updated=6, deleted=0, compressed=0) — although this run also revealed the timezone-naive bug (E16 below), which was fixed before confirming the full run succeeded.
 
-### E10 (pending): Live MCP client integration
+### E10 (✅ resolved): Live MCP client integration
 
 **Question:** does a real MCP client (Claude Desktop or Claude Code) actually call `get_context` and `store_memory` with the frequency and reliability assumed by the v1.1 mitigations (strengthened `instructions` text, opportunistic auto-store inside `get_context`)?
 
-**Status:** not yet run. This is the experiment that would validate or invalidate the "partial mitigation" claim in `decisions/ADR-002-memory-gateway-for-reliability.md` — currently that claim is reasoned from how MCP clients typically behave, not measured.
+**Method:** connected the server to Claude Desktop via `claude_desktop_config.json` and ran a real multi-turn conversation.
 
-### E11 (pending): Real-world Arabic round-trip
+**Result:** `get_context` was called consistently on every turn, as instructed by the strengthened `instructions` text. This validates the "partial mitigation" claim in `decisions/ADR-002-memory-gateway-for-reliability.md` for Claude Desktop specifically — the model reliably called the tool without needing an explicit per-turn reminder.
+
+**Conclusion:** the MCP-native mitigation path works in practice, at least for Claude Desktop. The underlying protocol limitation (a client *could* choose not to call the tool) still stands — this result confirms observed behavior, not a protocol-level guarantee.
+
+### E11 (✅ resolved): Real-world Arabic round-trip
 
 **Question:** in a live session, does an Arabic emotional statement (e.g. "تزوجت الشهر الماضي") get correctly captured, embedded with the multilingual model, and later retrieved when referenced again in a different Arabic phrasing?
 
-**Status:** not yet run — depends on E9 being unblocked first.
+**Method:** stored an Arabic emotional statement through a live session, then referenced it later in the same conversation using different phrasing.
 
-### E12 (pending): Retrieval/storage latency baseline
+**Result:** the memory was correctly retrieved despite the differing phrasing, confirming the multilingual embedding model (`ADR-005`) produces usable semantic similarity for Arabic content end-to-end, not just in isolated unit tests.
+
+**Conclusion:** the Arabic semantic-search gap identified in `PROJECT_STATUS.md` §3.2 is confirmed fixed in real usage.
+
+### E12 (✅ resolved): Retrieval/storage latency baseline
 
 **Question:** what is the actual measured retrieval latency (linear-scan cosine similarity) at realistic archive sizes, and how close is it to the 150ms trigger threshold defined in `PROJECT_STATUS.md` §5.3?
 
-**Status:** not yet measured — no real embedding model has been run in this environment yet, and the archive has not been populated at any meaningful scale. This is the first concrete metric that should be collected once v2 development begins, per the Metrics defined for each version in `PROJECT_STATUS.md` §6.
+**Method:** observed retrieval responsiveness during manual real-machine testing (no instrumented timing).
+
+**Result:** retrieval felt responsive with no noticeable delay at the archive sizes exercised during testing. No precise latency figure or archive size was captured.
+
+**Conclusion:** no regression or noticeable slowness at current (small) archive scale. This is a qualitative result, not a measurement — an instrumented figure against the 150ms threshold and a known archive size is still worth capturing before the linear-scan migration trigger in `PROJECT_STATUS.md` §5 becomes relevant at larger scale.
+
+---
+
+## v2.1 — Hotfix
+
+### E16: Does the forgetting cycle survive a database with timezone-naive timestamps?
+
+**Question:** can `run_forgetting_cycle()` process entries written by v1 / v1.1 (which stored `datetime.now()` without `timezone.utc`) without crashing?
+
+**Method:** ran `main.py` on a real machine with an existing `archive.db` populated by v1.1. The startup catch-up triggered the forgetting cycle immediately.
+
+**Result:** crashed with `TypeError: can't subtract offset-naive and offset-aware datetimes` in `_recency_score()` inside `memory/forgetting.py`. The cause was traced to `_row_to_entry()` in `memory/archive.py` returning a `datetime` without `tzinfo`, while `datetime.now(timezone.utc)` is offset-aware.
+
+**Fix:** added a `tzinfo` guard in `_row_to_entry()`: if `dt.tzinfo is None`, replace it with `timezone.utc` before returning.
+
+**Re-run result:** crash gone. Startup catch-up completed successfully: `updated=6, deleted=0, compressed=0`. Scheduler started and the live weekly timer was registered normally.
+
+**Conclusion:** the fix is correct and backward-compatible. Any pre-existing database (v1 or v1.1) can be used with v2.1 without migration.

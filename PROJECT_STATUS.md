@@ -1,6 +1,6 @@
 # Human Memory System — Project Status & Roadmap
 
-*Last updated: July 2026 — v2*
+*Last updated: July 2026 — v2.2*
 
 ---
 
@@ -13,6 +13,8 @@ This document describes:
 - A full evaluation of v1, including where it fails in real-world use (Section 3)
 - What was fixed in **v1.1** to address those failures, and how (Section 4)
 - What was added in **v2** (Warm Layer) (Section 5)
+- What was hotfixed in **v2.1** (Section 5.5)
+- What was fixed in **v2.2** (Section 5.6)
 - What each future version (**v3 → v6**) must add, in detail (Section 6)
 
 ---
@@ -195,9 +197,9 @@ This is intentionally rule-based rather than LLM-based for this specific job: an
 **Important documented limitation:** this fix fully solves the problem for direct API integrations (a custom wrapper around the OpenAI/Gemini/Claude API using `MemoryGateway` directly — see the updated README). It does **not** fully solve it for MCP-native clients like Claude Desktop/Code, because MCP's protocol gives the *client*, not the server, control over when tools are called — this is a protocol-level constraint, not a gap in this codebase.
 
 **Partial mitigation added for MCP-native clients (`mcp_server.py`):**
-- `get_context` — the tool most reliably called every turn by an MCP client trying to be helpful — now also opportunistically auto-stores the incoming user message as a side effect, using the same rule-based engine. This does not capture the assistant's own reply (only the Gateway path guarantees that), but it meaningfully reduces data loss on the user-message side even without `store_memory` ever being called.
+- `get_context` — the tool most reliably called every turn by an MCP client trying to be helpful — now also opportunistically auto-stores the incoming user message as a side effect, using the same rule-based engine. This does not capture the assistant's own reply (only the Gateway path guarantees that), but it meaningfully reduces data loss on the user-message side even without `store_memory` ever being called. **(Removed in v2.2 — see §5.6. This mitigation caused test/exploratory queries to be stored verbatim as if they were memories, polluting retrieval; `get_context` is now read-only.)**
 - `store_memory`'s `importance`, `tags`, and `emotional_weight` parameters are now optional (previously had hardcoded defaults). When the calling model omits them, the server falls back to the same rule-based extraction used by the Gateway, instead of a flat `0.5` default — so behavior is consistent regardless of whether a model bothers to compute these values itself.
-- The MCP server's `instructions` text was strengthened to explicitly tell the model to call `get_context` on *every* message, even ones that seem unrelated to memory, specifically because it now also keeps the Fast Layer current and opportunistically captures the user's message.
+- The MCP server's `instructions` text was strengthened to explicitly tell the model to call `get_context` on *every* message, even ones that seem unrelated to memory, specifically because it now also keeps the Fast Layer current and opportunistically captures the user's message. **(The opportunistic-capture rationale no longer applies as of v2.2 — see §5.6 — though calling `get_context` every turn is still the correct guidance for keeping the Fast Layer/Warm Layer/retrieved context current.)**
 
 ### 4.2 Fix: multilingual embeddings
 
@@ -267,7 +269,7 @@ The score threshold is `0.45` (higher than the Archive's `0.30`) to avoid false 
 ### 5.3 MCP & Gateway Integration
 
 - `memory/gateway.py`: `build_context()` now queries the Warm Layer and includes `warm_attributes` in the context block. `auto_store_turn()` routes candidates appropriately using the new dual routing logic.
-- `mcp_server.py`: `get_context` now opportunistically auto-upserts warm attributes on top of archiving them. A new explicit `update_warm_attribute` tool was added for MCP clients to explicitly manage these stable personal facts.
+- `mcp_server.py`: `get_context` now opportunistically auto-upserts warm attributes on top of archiving them. A new explicit `update_warm_attribute` tool was added for MCP clients to explicitly manage these stable personal facts. **(The opportunistic auto-upsert was removed in v2.2 — see §5.6.)**
 
 ### 5.4 Testing performed for v2
 
@@ -279,7 +281,33 @@ The score threshold is `0.45` (higher than the Archive's `0.30`) to avoid false 
 
 ---
 
-## 6. What Remains — Future Versions
+### 5.5 Hotfix \u2014 v2.1
+
+**Bug:** `TypeError: can't subtract offset-naive and offset-aware datetimes` in the forgetting cycle at startup.
+
+**Root cause:** Entries written to SQLite by v1 / v1.1 stored `timestamp` and `last_accessed` as plain ISO 8601 strings without a UTC offset, because early code called `datetime.now()` (offset-naive) instead of `datetime.now(timezone.utc)`. When v2's startup catch-up forgetting cycle ran on a machine with a real database for the first time, `_recency_score()` in `memory/forgetting.py` tried to compute `datetime.now(timezone.utc) - reference` where `reference` was offset-naive — Python raises a `TypeError` on this subtraction.
+
+**Fix:** `_row_to_entry()` in `memory/archive.py`. After parsing the stored ISO string with `datetime.fromisoformat()`, if the result has no `tzinfo`, it is immediately tagged as `timezone.utc` via `replace(tzinfo=timezone.utc)` before returning. This is safe because all timestamps in this system are stored in UTC, just without the suffix for pre-v2 entries.
+
+**Verified:** `main.py` was re-run after the fix. The startup catch-up completed without error, updating 6 entries (`updated=6, deleted=0, compressed=0`), and the scheduler started normally.
+
+---
+
+### 5.6 Fix \u2014 v2.2: Remove Opportunistic Auto-Store from `get_context`
+
+**Problem found:** the v1.1 mitigation described in \u00a74.1 (`get_context` opportunistically auto-storing the incoming message via `auto_extract`) caused a real data-quality regression once the system saw real usage. `get_context` is also the natural tool call for test/exploratory questions about existing memory (e.g. "Where do I live?") \u2014 not just new facts to remember. Because the auto-store side effect had no way to distinguish a question from a statement, these queries were being written into the Archive and/or upserted into the Warm Layer as if they were memories. Later semantic retrieval then matched against this stored query text instead of the actual facts, actively degrading retrieval quality \u2014 the opposite of the mitigation's intent.
+
+**Root cause:** `get_context` had two responsibilities bundled into one call \u2014 retrieval (its intended purpose) and opportunistic storage (a side effect) \u2014 violating separation of concerns and giving the caller no way to get one without the other.
+
+**Fix:** removed the auto-store side effect from `get_context` entirely. `get_context` (`mcp_server.py`) is now a pure read/retrieval function \u2014 it loads the Fast Layer, runs Warm Layer retrieval, runs Archive retrieval, and returns the assembled context. It no longer calls `archive.store()`, `warm_layer_mgr.upsert()`, or any `auto_extract.extract*()` function. All writes to memory now happen only through the pre-existing explicit tools: `store_memory` and `update_warm_attribute`. The `FastMCP` `instructions` text and the `get_context` tool docstring were updated to state plainly that `get_context` is read-only and that the model must call `store_memory`/`update_warm_attribute` explicitly. See [`ADR-009`](decisions/ADR-009-remove-opportunistic-auto-store-from-get-context.md) for the full decision record, including alternatives considered (e.g. trying to detect questions vs. statements before auto-storing \u2014 rejected as reintroducing the same kind of unreliable judgment call ADR-003 deliberately avoids for storage decisions).
+
+**Consequence \u2014 a known limitation reopens:** this fix does **not** re-solve the reliability problem ADR-001/ADR-002 describe for MCP-native clients. Nothing is stored via the MCP path unless the calling model explicitly calls `store_memory`/`update_warm_attribute` \u2014 the same gap that existed before the v1.1 mitigation was added, now understood to be the correct trade-off rather than something to silently paper over. The Gateway path (`memory/gateway.py`) is completely unaffected: `auto_store_turn()` still runs unconditionally after every turn for direct API integrations, per ADR-002.
+
+**Not addressed by this fix:** any Archive/Warm Layer entries written by the old opportunistic path before this fix (raw stored queries) are not retroactively cleaned up \u2014 they remain ordinary entries subject to the existing forgetting cycle.
+
+---
+
+## 6. What Remains \u2014 Future Versions
 
 Each version below adds exactly **one layer or one capability**, per the original design constraint of never combining multiple additions in a single version. No version should introduce breaking changes to the existing MCP tool interface (`get_context`, `store_memory` keep working as-is; new tools are additive).
 
@@ -404,6 +432,8 @@ Each version below adds exactly **one layer or one capability**, per the origina
 | v1 ✅ | Fast Layer, Archive, keyword retrieval, forgetting | — | `get_context`, `store_memory` |
 | v1.1 ✅ | Multilingual embeddings, forgetting-cycle startup catch-up, deterministic Gateway + rule-based auto-extraction | v1 | none new (Gateway is a library, not an MCP tool) |
 | v2 ✅ | Warm Layer, two-pass retrieval, upsert semantics, pluggable rule engine | v1.1 | `update_warm_attribute` |
+| v2.1 ✅ | Hotfix: timezone-naive datetime crash in forgetting cycle (`memory/archive.py`) | v2 | none |
+| v2.2 ✅ | Fix: removed opportunistic auto-store from `get_context` — it's now read-only; storage requires an explicit `store_memory`/`update_warm_attribute` call | v2.1 | none |
 | v3 | Task Layer | v1 Fast Layer (`active_task_id`) | `set_active_task` |
 | v4 | LLM-based retrieval judgment | v1 retrieval logic | none (internal) |
 | v5 | AI internal thought memory | v1 `MemoryEntry.source` field | `get_thought_history` (proposed) |
@@ -415,9 +445,9 @@ Each version below adds exactly **one layer or one capability**, per the origina
 
 ## 8. Immediate Next Step
 
-v2's logic was verified with unit/integration tests (Section 5.4), but could not be verified against a live embedding-model download in the current sandbox (Hugging Face is not reachable here). Before starting v3:
+v2.1 has been confirmed working on a real machine (startup catch-up passed, embedding model downloaded and loaded successfully). Before starting v3:
 
-1. Install dependencies and start `main.py` locally to confirm the new multilingual embedding model (`paraphrase-multilingual-MiniLM-L12-v2`) downloads and loads correctly.
+1. ✅ **Done** — `main.py` confirmed running locally: the multilingual embedding model (`paraphrase-multilingual-MiniLM-L12-v2`) downloads and loads correctly, and the startup catch-up forgetting cycle completes without errors.
 2. Connect the MCP server to a real client (Claude Desktop or Claude Code) and confirm `get_context` is called consistently and that `warm_attributes` appear in the response correctly.
 3. If a custom API wrapper is planned (OpenAI/Gemini/direct Claude API), integrate `memory/gateway.py` per the updated README and confirm `process_turn()` behaves as expected against the real model, including Warm Layer upserts.
 4. Run one full real-world loop against Arabic input specifically: store "أعيش في دبي" (I live in Dubai), confirm it upserts `location`, and confirm later retrieval works.

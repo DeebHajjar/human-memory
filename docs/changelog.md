@@ -6,6 +6,30 @@ Condensed, scannable diff between versions. For the full reasoning behind any ch
 
 ---
 
+## v2.2 (Fix)
+
+**Theme:** architectural correction — `get_context` was doing two jobs (retrieval + opportunistic storage); real usage showed this actively corrupted retrieval quality.
+
+### Fixed
+- **`mcp_server.py` — removed opportunistic auto-store from `get_context`:** the v1.1/v2 mitigation that had `get_context` silently call `auto_extract.extract_warm()` / `auto_extract.extract()` and write to the Warm Layer/Archive as a side effect was causing test/exploratory queries (e.g. "Where do I live?") to be stored verbatim as if they were memories, polluting later semantic retrieval. `get_context` is now a pure read/retrieval function — no calls to `archive.store()`, `warm_layer_mgr.upsert()`, or `auto_extract.extract*()` remain in it. See [`ADR-009`](decisions/ADR-009-remove-opportunistic-auto-store-from-get-context.md) and `PROJECT_STATUS.md` §5.6.
+
+### Changed
+- `mcp_server.py`: `FastMCP`'s `instructions` text and the `get_context` tool docstring updated to state plainly that `get_context` is read-only, and that `store_memory`/`update_warm_attribute` must be called explicitly to persist anything.
+
+### Known limitations (reopened, not a regression from before v1.1)
+- With the mitigation removed, storage for MCP-native clients (Claude Desktop/Code) once again depends entirely on the calling model choosing to call `store_memory`/`update_warm_attribute` — the same gap ADR-001/ADR-002 originally described. This is now treated as the correct trade-off rather than something to silently paper over with a side effect that had its own correctness problems. The Gateway path (`memory/gateway.py`) is unaffected — `auto_store_turn()` still runs unconditionally after every turn for direct API integrations.
+
+---
+
+## v2.1 (Hotfix)
+
+**Theme:** bug discovered during first real-machine run of `main.py` after v2.
+
+### Fixed
+- **`memory/archive.py` — `TypeError` in forgetting cycle on startup (`offset-naive and offset-aware datetimes`):** Prior to v2.1, entries written to SQLite by v1 did not include timezone information in the `timestamp` / `last_accessed` columns (SQLite stores them as plain ISO strings, and early code called `datetime.now()` without `timezone.utc`). At startup in v2, the scheduler's `run_startup_catchup()` called the forgetting cycle, which compared these offset-naive datetimes against `datetime.now(timezone.utc)` (offset-aware). Python's `datetime` raises a `TypeError` on this subtraction. Fixed in `_row_to_entry()` in `memory/archive.py`: after `datetime.fromisoformat()`, if `tzinfo is None`, attach `timezone.utc` before returning.
+
+---
+
 ## v2
 
 **Theme:** secondary context (Warm Layer) + extraction refactor (pluggable rule engine).

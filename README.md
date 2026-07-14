@@ -277,7 +277,7 @@ The Gateway pattern above is recommended over this for anything beyond a quick t
 
 ### `get_context`
 
-Call before generating a response.
+Call before generating a response. **Read-only** — it never writes to the Archive or Warm Layer, no matter what the message contains. (An earlier version opportunistically wrote to memory as a side effect of this call; that was removed after it caused test/exploratory queries to be stored as if they were memories — see [`ADR-009`](docs/decisions/ADR-009-remove-opportunistic-auto-store-from-get-context.md).) Call `store_memory` / `update_warm_attribute` explicitly for anything worth remembering.
 
 **Input:** `{ "message": "The user's incoming message" }`
 
@@ -402,7 +402,7 @@ human-memory-system/
 
 Documented honestly rather than hidden — see [`docs/decisions/`](docs/decisions/README.md) for the full reasoning behind each:
 
-- **MCP is client-driven.** The MCP server cannot force an MCP-native client (Claude Desktop/Code) to call `get_context`/`store_memory` on every turn — that's a protocol property, not a bug here ([ADR-001](docs/decisions/ADR-001-use-mcp-protocol.md)). The `Gateway` fully solves this only for direct API integrations that call it directly ([ADR-002](docs/decisions/ADR-002-memory-gateway-for-reliability.md)).
+- **MCP is client-driven.** The MCP server cannot force an MCP-native client (Claude Desktop/Code) to call `get_context`/`store_memory` on every turn — that's a protocol property, not a bug here ([ADR-001](docs/decisions/ADR-001-use-mcp-protocol.md)). The `Gateway` fully solves this only for direct API integrations that call it directly ([ADR-002](docs/decisions/ADR-002-memory-gateway-for-reliability.md)). A previous partial mitigation had `get_context` opportunistically write to memory as a side effect; it was removed because it caused test/exploratory queries to be stored as if they were memories, polluting retrieval ([ADR-009](docs/decisions/ADR-009-remove-opportunistic-auto-store-from-get-context.md)) — for MCP-native clients, storage now depends entirely on the model explicitly calling `store_memory`/`update_warm_attribute`.
 - **Keyword-only retrieval triggers** (current version) will under-fire on subtle references and can over-fire on generic tag words. An LLM-based judgment fallback is planned (see roadmap).
 - **Linear-scan retrieval.** No vector index yet — fine at small-to-medium archive sizes, with a documented migration trigger once it isn't. See [`docs/architecture.md`](docs/architecture.md) §7 and `PROJECT_STATUS.md` §5.
 - **No contradiction/duplicate detection yet.** Two conflicting facts can both be stored and retrieved together. Planned as a future version (`v7 — Memory Consistency`).

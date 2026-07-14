@@ -1,6 +1,6 @@
 # ADR-002: A Deterministic Gateway, Alongside MCP, Not Instead of It
 
-**Status:** Accepted
+**Status:** Accepted — the "partial mitigation" consequence below (opportunistic auto-store in `get_context`) was later removed; see [ADR-009](ADR-009-remove-opportunistic-auto-store-from-get-context.md).
 
 ---
 

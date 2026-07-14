@@ -249,7 +249,12 @@ class ArchiveDB:
 
     def _row_to_entry(self, row: sqlite3.Row) -> MemoryEntry:
         def _dt(val: Optional[str]) -> Optional[datetime]:
-            return datetime.fromisoformat(val) if val else None
+            if not val:
+                return None
+            dt = datetime.fromisoformat(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
 
         return MemoryEntry(
             id               = row["id"],

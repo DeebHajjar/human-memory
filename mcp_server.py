@@ -11,8 +11,13 @@ v2 changes vs v1.1:
   • get_context now includes a warm_attributes block in its response,
     populated when semantically relevant warm attributes exist.
   • update_warm_attribute is a new tool for explicit Warm Layer management.
-  • Opportunistic auto-store on get_context now also checks for Warm Layer
-    candidates and upserts them if found.
+
+get_context is READ-ONLY: it never writes to the Archive or Warm Layer.
+An earlier opportunistic auto-store side effect on get_context was removed
+(see docs/decisions/ADR-009-remove-opportunistic-auto-store-from-get-context.md) —
+it caused exploratory/test queries to be stored verbatim as if they were
+memories, polluting semantic retrieval. All writes now happen only through
+explicit calls to store_memory / update_warm_attribute.
 
 KNOWN LIMITATION (see PROJECT_STATUS.md §3.1 and §4.1):
 MCP is a client-driven protocol — this server cannot force an MCP client
@@ -81,11 +86,14 @@ mcp = FastMCP(
     instructions=(
         "You have access to a local memory system with three layers. "
         "Call get_context with EVERY user message BEFORE generating your response — "
-        "do this even if the message seems unrelated to memory, since it also keeps "
-        "your core identity context (fast_layer) up to date and surfaces relevant "
-        "personal attributes (warm_attributes). "
-        "Call store_memory AFTER your response whenever you learn something worth "
-        "remembering (facts, preferences, decisions, ongoing projects). "
+        "do this even if the message seems unrelated to memory, since it surfaces "
+        "the user's core identity (fast_layer) and any relevant personal attributes "
+        "(warm_attributes) and past memories (retrieved_memories). "
+        "get_context is READ-ONLY — it never stores anything, no matter what the "
+        "message contains. "
+        "You must explicitly call store_memory AFTER your response whenever you "
+        "learn something worth remembering (facts, preferences, decisions, ongoing "
+        "projects) — nothing is remembered unless you call store_memory yourself. "
         "Call update_warm_attribute whenever you learn a stable biographical fact "
         "such as location, occupation, birthdate, or a recurring habit — "
         "this replaces the previous value rather than adding a duplicate. "
@@ -102,6 +110,10 @@ mcp = FastMCP(
 def get_context(message: str) -> str:
     """
     Build a layered memory context for an incoming user message.
+
+    READ-ONLY: this tool never writes to the Archive or Warm Layer, no matter
+    what the message contains. Call store_memory / update_warm_attribute
+    explicitly afterward for anything worth remembering.
 
     Always returns:
       fast_layer         — user's core identity (always present)
@@ -143,36 +155,6 @@ def get_context(message: str) -> str:
         warm_attributes=warm_attrs,
         warm_retrieval_triggered=bool(warm_attrs),
     )
-
-    # v1.1 mitigation + v2 extension: opportunistically auto-store the user's
-    # own message here, since get_context is the tool most reliably called
-    # every turn by MCP-native clients.
-    try:
-        # Check for Warm Layer candidates first (v2)
-        warm_candidate = auto_extract.extract_warm(message)
-        if warm_candidate is not None:
-            attr = WarmAttribute(
-                key=warm_candidate.key,
-                value=warm_candidate.value,
-                context_hint=warm_candidate.context_hint,
-                importance=warm_candidate.importance,
-            )
-            warm_layer_mgr.upsert(attr, embedding=query_emb)
-
-        # Then store in Archive as usual
-        fact = auto_extract.extract(message, source="user")
-        if fact is not None:
-            entry = MemoryEntry(
-                content=fact.content,
-                source=fact.source,
-                importance_score=fact.importance,
-                emotional_weight=fact.emotional_weight,
-                tags=fact.tags,
-            )
-            archive.store(entry, embedding=query_emb)
-    except Exception as exc:
-        # Never let auto-store break the primary get_context response
-        logger.warning(f"Opportunistic auto-store failed (non-fatal): {exc}")
 
     return json.dumps(context.to_dict(), indent=2, ensure_ascii=False)
 
