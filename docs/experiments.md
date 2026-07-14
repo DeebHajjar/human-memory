@@ -233,3 +233,35 @@ These were originally recorded as untested (mostly due to the development sandbo
 **Re-run result:** crash gone. Startup catch-up completed successfully: `updated=6, deleted=0, compressed=0`. Scheduler started and the live weekly timer was registered normally.
 
 **Conclusion:** the fix is correct and backward-compatible. Any pre-existing database (v1 or v1.1) can be used with v2.1 without migration.
+
+---
+
+## v2.3 — Fix (first-call timeout)
+
+### E17: Why does the first tool call after a cold server start hang, and does eager startup warm-up fix it?
+
+**Question:** on a freshly started server, the first tool call (usually `get_context`) never returns and the client times out, while an immediate retry works and it only happens once per process. Where is the time going, and does warming the embedding model up at startup remove the first-call penalty?
+
+**Method:** ran a read-only timing harness (via the project venv) that reproduces `mcp_server.py`'s exact init path, timing each step separately: project imports, `FastLayerManager()`, `ArchiveDB()` + schema, `RetrievalEngine()`, `WarmLayerManager()` + schema, then `import sentence_transformers`, `SentenceTransformer(model)` load, and first/second `.encode()`. Then verified the fix end-to-end with a small `mcp.client.stdio` client: launched `mcp_server.py`, ran `initialize`, and timed two consecutive `get_context` calls. Model was already cached locally for both measurements.
+
+**Result (diagnosis, before fix):**
+
+| Step | Time |
+|---|---|
+| import project modules | 0.120s |
+| `FastLayerManager()` | 0.000s |
+| `ArchiveDB()` + schema init (SQLite) | 0.014s |
+| `RetrievalEngine()` | 0.000s |
+| `WarmLayerManager()` + schema | 0.000s |
+| **eager/cheap init subtotal** | **0.134s** |
+| `import sentence_transformers` (pulls in torch) | 5.002s |
+| `SentenceTransformer(model)` load | 6.571s |
+| first `.encode()` | 0.219s |
+| **first-tool-call one-time cost** | **≈ 11.8s** |
+| second `.encode()` | 0.016s |
+
+The eager init (SQLite schema, layer managers) is ~0.13s — not the bottleneck; lazy DB init and a stdio handshake race were ruled out. The entire cost is `import sentence_transformers` + model load (~11.8s, model already cached), confirmed one-time by the 16ms second encode. A network round-trip to the HF Hub also happens on load (observed "sending unauthenticated requests to the HF Hub" warning), which worsens the stall on a slow/unreachable network.
+
+**Result (after fix — eager warm-up via FastMCP `lifespan`):** server stderr showed `Warming up embedding model…` → `Embedding model ready in 11.6s — server accepting requests` during `initialize`, i.e. before serving. First `get_context` call: **0.088s**; second: **0.036s** — effectively equal.
+
+**Conclusion:** root cause confirmed as lazy first-use model loading, not DB init or transport lifecycle. Warming the model up at startup (`ADR-010`) shifts the one-time ~12s cost off the first tool call and onto the `initialize` handshake, so the first real request is fast. Symptom (first call hangs, retry works, once per process) is resolved.

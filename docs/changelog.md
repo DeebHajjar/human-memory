@@ -6,6 +6,21 @@ Condensed, scannable diff between versions. For the full reasoning behind any ch
 
 ---
 
+## v2.3 (Fix)
+
+**Theme:** startup timing — the first tool call after a cold server start timed out because the embedding model loaded lazily on first use.
+
+### Fixed
+- **`mcp_server.py` — first tool call no longer hangs on a cold start:** the embedding model (`sentence-transformers` + `torch`) was loaded lazily inside `_get_embedder()` on first use, so the first tool call absorbed the whole ~12s load cost (measured, model already cached) and exceeded the MCP client's per-tool-call timeout; a retry found the model cached in the process global and succeeded, so it only ever happened once per process. Now the model is warmed up **eagerly at startup, before any request is processed**, via FastMCP's `lifespan` hook (plus one dummy `encode()`). Covers both entry points (`main.py` and `python mcp_server.py`) since both call `mcp.run()`. See [`ADR-010`](decisions/ADR-010-eager-embedding-warmup-at-startup.md), `PROJECT_STATUS.md` §5.7, and `experiments.md` E17.
+
+### Changed
+- `mcp_server.py`: added an async `lifespan` context manager and passed `lifespan=` to the `FastMCP(...)` constructor; two concise stderr log lines mark warm-up start/finish. `_get_embedder()` is retained unchanged as an idempotent fallback. No tool-handler logic changed.
+
+### Verified
+- End-to-end over stdio: the ~12s load now happens during `initialize`; first `get_context` call measured **0.088s** vs **0.036s** for the second (previously the first would time out and the second was instant).
+
+---
+
 ## v2.2 (Fix)
 
 **Theme:** architectural correction — `get_context` was doing two jobs (retrieval + opportunistic storage); real usage showed this actively corrupted retrieval quality.

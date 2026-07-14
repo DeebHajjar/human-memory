@@ -33,7 +33,9 @@ Or via main.py (includes v2 startup catch-up + background scheduler):
 
 import json
 import logging
-from typing import List, Optional
+import time
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -79,10 +81,39 @@ def _get_embedder():
     return _embedder
 
 
+# ── Startup warm-up (server lifespan) ─────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    """
+    Runs once at server startup, BEFORE any JSON-RPC request is processed.
+
+    The embedding model (sentence-transformers + torch) takes ~10s+ to import
+    and load even when cached. If that happened lazily on the first tool call
+    (via _get_embedder()), the first call would exceed the MCP client's
+    tool-call timeout and appear to hang — while a retry, finding the model
+    already loaded, would succeed. Loading it here shifts that one-time cost to
+    server startup (before the first request is processed) so the first real
+    tool call is fast.
+    """
+    logger.info("Warming up embedding model…")
+    started = time.perf_counter()
+    embedder = _get_embedder()
+    # One dummy encode so any first-call lazy init inside the model is paid now.
+    embedder.encode("warm up", show_progress_bar=False)
+    logger.info(
+        f"Embedding model ready in {time.perf_counter() - started:.1f}s — "
+        "server accepting requests"
+    )
+    yield
+
+
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="Human Memory System",
+    lifespan=lifespan,
     instructions=(
         "You have access to a local memory system with three layers. "
         "Call get_context with EVERY user message BEFORE generating your response — "

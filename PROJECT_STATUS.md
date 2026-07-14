@@ -1,6 +1,6 @@
 # Human Memory System — Project Status & Roadmap
 
-*Last updated: July 2026 — v2.2*
+*Last updated: July 2026 — v2.3*
 
 ---
 
@@ -15,6 +15,7 @@ This document describes:
 - What was added in **v2** (Warm Layer) (Section 5)
 - What was hotfixed in **v2.1** (Section 5.5)
 - What was fixed in **v2.2** (Section 5.6)
+- What was fixed in **v2.3** (Section 5.7)
 - What each future version (**v3 → v6**) must add, in detail (Section 6)
 
 ---
@@ -307,6 +308,18 @@ The score threshold is `0.45` (higher than the Archive's `0.30`) to avoid false 
 
 ---
 
+### 5.7 Fix \u2014 v2.3: Warm Up the Embedding Model at Startup (First-Call Timeout)
+
+**Problem found:** on a freshly started server, the *first* tool call of a session (usually `get_context`) never returned \u2014 the client waited and eventually timed out with no result. Retrying the identical call immediately after worked and returned correctly, and it only ever happened once per server process.
+
+**Root cause (confirmed by measurement, not assumed):** the embedding model was loaded **lazily on first use** inside `_get_embedder()` in `mcp_server.py`. Every tool handler calls it, so the first call after startup absorbed the entire one-time load cost. Measured on a real machine *with the model already cached*: `import sentence_transformers` (~5.0s) + `SentenceTransformer(model)` load (~6.6s) + first `.encode()` (~0.2s) \u2248 **11.8s** \u2014 versus ~0.13s for all the eager init (SQLite schema, layer managers) and ~16ms for a warmed `.encode()`. That 11.8s exceeds the MCP client's per-tool-call timeout, so the first call appeared to hang; the load finished in the background and populated the process-global `_embedder`, so the immediate retry was instant; the global persists for the process, so it happened exactly once. On load, `sentence-transformers` also makes an HF Hub network round-trip, which stalls further on a slow/unreachable network (and becomes a multi-minute *download* if the model isn't cached yet). Neither entry point avoided this: `main.py`'s startup catch-up uses a *separate* embedder in `scheduler.py` and only when forgetting is overdue, and `python mcp_server.py` skips catch-up entirely.
+
+**Fix:** load the embedding model **eagerly at server startup, before any request is processed**, via FastMCP's documented `lifespan` hook (`mcp` 1.28.1). The lifespan calls the existing `_get_embedder()` plus one dummy `encode("warm up")`; because both entry points call `mcp.run()`, the warm-up covers both. `_get_embedder()` is kept as an idempotent fallback so behaviour is unchanged if warm-up is ever skipped. Scope was limited to startup timing \u2014 `get_context`'s retrieval logic, `store_memory`, `update_warm_attribute`, and `memory/gateway.py` were not touched. Two concise stderr log lines around the warm-up were kept (safe for the stdio protocol; make a slow/cold start visible). See [`ADR-010`](decisions/ADR-010-eager-embedding-warmup-at-startup.md) for the decision record and alternatives considered, and `experiments.md` E17 for the timings.
+
+**Verified:** end-to-end over stdio, the ~12s load now happens during `initialize` (stderr shows `Warming up embedding model\u2026` \u2192 `Embedding model ready in 11.6s \u2014 server accepting requests`), and the first `get_context` call is **0.088s** vs **0.036s** for the second \u2014 effectively equal, i.e. the model is fully warm before the first request. `initialize` itself now takes ~12s, but clients wait on `initialize` and its timeout is far more tolerant than the per-tool-call timeout.
+
+---
+
 ## 6. What Remains \u2014 Future Versions
 
 Each version below adds exactly **one layer or one capability**, per the original design constraint of never combining multiple additions in a single version. No version should introduce breaking changes to the existing MCP tool interface (`get_context`, `store_memory` keep working as-is; new tools are additive).
@@ -434,6 +447,7 @@ Each version below adds exactly **one layer or one capability**, per the origina
 | v2 ✅ | Warm Layer, two-pass retrieval, upsert semantics, pluggable rule engine | v1.1 | `update_warm_attribute` |
 | v2.1 ✅ | Hotfix: timezone-naive datetime crash in forgetting cycle (`memory/archive.py`) | v2 | none |
 | v2.2 ✅ | Fix: removed opportunistic auto-store from `get_context` — it's now read-only; storage requires an explicit `store_memory`/`update_warm_attribute` call | v2.1 | none |
+| v2.3 ✅ | Fix: warm up the embedding model at startup (FastMCP `lifespan`) so the first tool call no longer times out on a cold server (`mcp_server.py`) | v2.2 | none |
 | v3 | Task Layer | v1 Fast Layer (`active_task_id`) | `set_active_task` |
 | v4 | LLM-based retrieval judgment | v1 retrieval logic | none (internal) |
 | v5 | AI internal thought memory | v1 `MemoryEntry.source` field | `get_thought_history` (proposed) |

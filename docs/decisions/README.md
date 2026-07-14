@@ -15,3 +15,4 @@ If a decision is later reversed or replaced, a new ADR is added noting it supers
 | [007](ADR-007-archive-not-delete-superseded-facts.md) | Superseded facts are archived, not deleted | Accepted — not yet implemented (v7) |
 | [008](ADR-008-warm-layer-dual-routing-and-upsert.md) | Warm Layer uses upsert semantics but dual-routes to Archive | Accepted |
 | [009](ADR-009-remove-opportunistic-auto-store-from-get-context.md) | Remove opportunistic auto-store from `get_context` | Accepted |
+| [010](ADR-010-eager-embedding-warmup-at-startup.md) | Warm up the embedding model eagerly at startup, not lazily on first request | Accepted |

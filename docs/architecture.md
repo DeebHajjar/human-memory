@@ -91,9 +91,11 @@ This is the most important structural fact about the system and the thing most l
 
 ### 4.1 `mcp_server.py` — for MCP-native clients
 
-Exposes two tools (`get_context`, `store_memory`) over the standard MCP protocol on stdio transport. This is what Claude Desktop, Claude Code, or any other MCP-compatible client talks to.
+Exposes three tools (`get_context`, `store_memory`, `update_warm_attribute`) over the standard MCP protocol on stdio transport. This is what Claude Desktop, Claude Code, or any other MCP-compatible client talks to.
 
 **Critical property: this server is entirely passive.** It cannot decide on its own to inject context or store a memory — it can only respond when the client's model chooses to call one of its tools. This is a property of the MCP protocol itself (client-driven), not a limitation specific to this codebase. See `decisions/ADR-001-use-mcp-protocol.md` and `decisions/ADR-002-memory-gateway-for-reliability.md` for the full reasoning and what was done to mitigate it.
+
+**Startup warm-up.** The embedding model (`sentence-transformers` + `torch`) is loaded eagerly at server startup via FastMCP's `lifespan` hook, *before* the server serves any request — not lazily on first use. Otherwise the first tool call would absorb the ~12s model-load cost and exceed the client's tool-call timeout. See `decisions/ADR-010-eager-embedding-warmup-at-startup.md`.
 
 ### 4.2 `memory/gateway.py` — for direct API integrations
 
