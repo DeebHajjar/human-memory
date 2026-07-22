@@ -165,6 +165,8 @@ This is an accepted, *documented* limitation of v1 (the spec explicitly deferred
 - **Under-fires:** a message like "how did the tracker project go?" (no exact keyword match, no known tag match) would not trigger retrieval even though it's clearly asking about stored context.
 - **Over-fires:** if a generic word (e.g. "life") became a stored tag, any unrelated sentence containing that word would trigger an unnecessary archive search.
 
+> **Resolved in v2.4** — not by v4's planned LLM judgment, but by removing the trigger gate entirely: measured bilingual testing (`experiments.md` E18) showed the under-fire case was the dominant real-world failure (a cosine-0.547 match returned nothing), while the query embedding was already being computed every call anyway. Semantic search now always runs; keyword signals became per-entry similarity boosts. See §5.8 and `ADR-011`.
+
 ### 3.6 No conflict or duplicate detection
 
 If the user's situation changes (e.g., a stored fact becomes outdated), v1 has no mechanism to detect that a new statement contradicts or supersedes an old one. Both versions could be retrieved together in the future, potentially confusing the responding model with stale, conflicting information.
@@ -318,6 +320,16 @@ The score threshold is `0.45` (higher than the Archive's `0.30`) to avoid false 
 
 **Verified:** end-to-end over stdio, the ~12s load now happens during `initialize` (stderr shows `Warming up embedding model\u2026` \u2192 `Embedding model ready in 11.6s \u2014 server accepting requests`), and the first `get_context` call is **0.088s** vs **0.036s** for the second \u2014 effectively equal, i.e. the model is fully warm before the first request. `initialize` itself now takes ~12s, but clients wait on `initialize` and its timeout is far more tolerant than the per-tool-call timeout.
 
+### 5.8 Fix \u2014 v2.4: Always-On Semantic Retrieval with a Raw-Similarity Floor
+
+**Problem found:** manual bilingual testing (~11 mixed English/Levantine-Arabic memories) showed retrieval failing on direct recall questions in *both* languages \u2014 "What's my cat's name?" / "\u0634\u0648 \u0627\u0633\u0645 \u0642\u0637\u062a\u064a\u061f" returned nothing despite an explicitly stored answer \u2014 while queries that did fire returned mostly irrelevant results (5 returned, 1 relevant), and the Warm Layer surfaced unrelated attributes (a running-training question returned `favorite_programming_language`). Storing the same content with Arabic tags mysteriously "fixed" Arabic retrieval, which initially pointed at embedding quality.
+
+**Root cause (confirmed by measurement, not assumed \u2014 `experiments.md` E18):** three compounding defects, all architectural rather than model-quality. (1) `should_retrieve()` gated semantic search behind exact keyword triggers \u2014 the cat memory matched at cosine **0.547** in both languages but the search never ran because no stored tag word appeared in the query; the "Arabic tags fix" was purely this gate opening (tags are never embedded). The gate also protected nothing: the query embedding was already computed unconditionally for the Warm Layer. (2) The pass threshold mixed importance into the decision (`0.7\u00d7sim + 0.3\u00d7imp \u2265 0.30`), admitting entries at near-noise similarity ~0.26 \u2014 same-person memories cluster at 0.25\u20130.40 in this model. (3) The Warm Layer's keyword pass matched **stopwords** in `context_hint` sentences ("the", "for", "should") and auto-included hits with a fabricated 0.92 score; its semantic pass had the same importance-in-threshold flaw (false positives measured at sim 0.42\u20130.43).
+
+**Fix (`ADR-011`):** semantic search runs on **every** message for both Archive and Warm Layer; inclusion is decided by **raw cosine similarity only** (floors 0.35 / 0.55, calibrated in E18); importance ranks passers but never admits an entry; keyword signals became similarity *boosts* (+0.15 when an entry's own tag, or a stopword-filtered hint content word, appears in the message) instead of gates/auto-includes. Embedded text is unchanged, so no data migration. `retrieval_triggered` now means "relevant memories found". A committed bilingual replay benchmark (`tools/replay_retrieval.py`) is the acceptance test for any future scoring or embedding-model change. Drive-by: `warm_layer.py`'s `upsert()` naive `datetime.utcnow()` \u2192 UTC-aware (latent E16-class bug).
+
+**Verified:** full before/after table in E18 \u2014 cat retrieval works in both languages, the Arabic food query retrieves via tag boost, precision improved (3 results vs 7 on the English food query), and all observed warm-layer false positives are excluded while the legitimate programming-language probe still retrieves its attribute. **Known residual:** dialectal-Arabic similarity collapse (a Levantine query scored **0.031** against its own Levantine memory) is an embedding-model limitation no scoring change can fix \u2014 the candidate follow-up is a stronger multilingual model (revisits `ADR-005`).
+
 ---
 
 ## 6. What Remains \u2014 Future Versions
@@ -356,25 +368,25 @@ Each version below adds exactly **one layer or one capability**, per the origina
 
 ### v4 — LLM-Based Retrieval Judgment
 
-**Purpose:** complete the two-step retrieval decision logic originally specified. v1 only implemented Step 1 (keyword triggers); v4 adds Step 2.
+> **Premise revised by v2.4 (`ADR-011`):** the original v4 design assumed the two-step trigger logic ("Step 1 keyword gate, Step 2 LLM fallback deciding *whether* to search"). v2.4 removed the gate — semantic search now always runs, which resolves the under-fire problem v4 was primarily meant to close (§3.5). What remains for v4 is the *precision* half of the problem: raw similarity cannot distinguish "mentions the same person/style" from "actually answers the question" (E18's residual: same-person noise passing the floor on English queries). v4's judgment call is therefore now a **relevance filter/re-ranker over already-retrieved candidates**, not a search trigger.
 
 **Must contain:**
-- A fallback judgment call, used **only** when Step 1 (keyword/tag triggers) is ambiguous or returns no match but the message still might benefit from memory.
+- A judgment call over the top-k candidates returned by the (always-on) semantic search, pruning entries that clear the similarity floor but don't bear on the message.
 - The judgment call should use a small, fast model — explicitly *not* the main conversational model — to keep latency and cost low. This should be configurable (model name/endpoint) rather than hardcoded, to preserve model-agnosticism.
-- Prompt should be minimal and binary: "Does answering this message require information from past conversations? Answer yes or no."
+- Prompt should be minimal and per-candidate binary: "Does this stored memory help answer the current message? Answer yes or no."
 
 **Behavior to implement:**
-- Extend `RetrievalEngine.should_retrieve()` with a second-stage check that only fires when Step 1 returns `False`.
-- Add a timeout/fallback: if the judgment call fails or the small model is unavailable, default to `False` (no retrieval) rather than blocking the main response — this preserves the "graceful degradation" constraint from the original spec.
-- Log or expose which step triggered retrieval (keyword vs. LLM judgment) for debugging and future tuning.
+- Add the filtering stage inside `RetrievalEngine.retrieve()` (or as a wrapper), applied only when candidates exist — zero candidates means zero LLM calls.
+- Add a timeout/fallback: if the judgment call fails or the small model is unavailable, return the unfiltered similarity-ranked candidates rather than blocking the main response — this preserves the "graceful degradation" constraint from the original spec.
+- Log or expose which candidates were pruned by the judgment stage for debugging and future tuning.
 
 **New/changed interface:**
 - No new MCP tools required — this is an internal enhancement to `get_context`'s existing decision logic.
 - `config.py` should gain settings for the judgment model endpoint/name and a timeout value.
 
 **Testing checklist for v4:**
-- Messages that Step 1 misses but clearly need memory (e.g. subtle references without explicit "last time" phrasing) are now caught.
-- Judgment-call failures do not crash or hang `get_context` — degrade gracefully to no-retrieval.
+- E18's measured precision failures (e.g. the cat memory passing the floor on "What is Deeb's favorite food?") are pruned by the judgment stage; re-run `tools/replay_retrieval.py` as the benchmark.
+- Judgment-call failures do not crash or hang `get_context` — degrade gracefully to unfiltered results.
 - Latency overhead of the added judgment call is measured and stays within an acceptable bound (should be documented once implemented).
 
 ---
@@ -448,12 +460,13 @@ Each version below adds exactly **one layer or one capability**, per the origina
 | v2.1 ✅ | Hotfix: timezone-naive datetime crash in forgetting cycle (`memory/archive.py`) | v2 | none |
 | v2.2 ✅ | Fix: removed opportunistic auto-store from `get_context` — it's now read-only; storage requires an explicit `store_memory`/`update_warm_attribute` call | v2.1 | none |
 | v2.3 ✅ | Fix: warm up the embedding model at startup (FastMCP `lifespan`) so the first tool call no longer times out on a cold server (`mcp_server.py`) | v2.2 | none |
+| v2.4 ✅ | Fix: always-on semantic retrieval — removed the keyword trigger gate, raw-similarity floors (importance ranks, never admits), keyword signals became boosts, warm-layer stopword false positives eliminated (`ADR-011`) | v2.3 | none |
 | v3 | Task Layer | v1 Fast Layer (`active_task_id`) | `set_active_task` |
-| v4 | LLM-based retrieval judgment | v1 retrieval logic | none (internal) |
+| v4 | LLM-based retrieval judgment (re-scoped by v2.4: relevance filter over retrieved candidates, no longer a search trigger) | v2.4 retrieval logic | none (internal) |
 | v5 | AI internal thought memory | v1 `MemoryEntry.source` field | `get_thought_history` (proposed) |
 | v6 | Topic-switching buffer | v1/v4 retrieval logic | none (internal, conversation-scoped) |
 
-**Open items not yet addressed by v2** (see Section 3): keyword-only retrieval triggers still under-fire/over-fire (3.5, intentionally deferred to v4 per the original spec), and there is still no conflict/duplicate detection for contradicting stored facts (3.6, not yet scheduled to a specific version — candidate for a future v7).
+**Open items** (see Section 3): keyword-trigger under-fire/over-fire (3.5) was resolved by v2.4's always-on retrieval; the remaining retrieval gaps are precision on same-person queries (deferred to v4's re-scoped relevance filter) and dialectal-Arabic embedding quality (needs a stronger multilingual model — revisits `ADR-005`). There is still no conflict/duplicate detection for contradicting stored facts (3.6, not yet scheduled to a specific version — candidate for a future v7).
 
 ---
 

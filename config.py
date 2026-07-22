@@ -25,9 +25,16 @@ EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDING_DIM   = 384
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
+#
+# v2.4: semantic search runs on EVERY message (the keyword trigger gate was
+# removed — see ADR-011). Pass/fail is decided on RAW cosine similarity only;
+# importance affects ranking among passers, never inclusion. A memory whose
+# own tags appear as words in the message gets a similarity boost — keyword
+# signals are evidence, not gates.
 
-TOP_K_RESULTS            = 5
-RETRIEVAL_SCORE_THRESHOLD = 0.30   # combined (similarity + importance) minimum
+TOP_K_RESULTS           = 5
+RETRIEVAL_SIM_THRESHOLD = 0.35   # min raw cosine sim (after tag boost) to return a memory
+RETRIEVAL_TAG_BOOST     = 0.15   # added to sim when one of the entry's own tags appears in the message
 
 # ── Importance scoring weights ────────────────────────────────────────────────
 
@@ -68,10 +75,16 @@ AUTO_STORE_EMOTIONAL_WEIGHT   = 1.0  # applied when a strong-signal phrase is fo
 # ── Warm Layer (v2) ──────────────────────────────────────────────────────────
 #
 # Secondary biographical/preference attributes retrieved on semantic relevance.
-# Threshold is intentionally higher than Archive (0.45 vs 0.30): warm attributes
+# Threshold is intentionally higher than Archive (0.55 vs 0.35): warm attributes
 # are specific stable facts, so false positives are worse than false negatives.
+# v2.4: pass/fail on raw similarity (after hint boost); weights rank passers.
+# 0.55 calibrated in experiments.md E18: an unrelated attribute sharing only
+# the "Deeb is …" phrasing measured sim 0.511, the true match 0.583 raw
+# (0.733 with hint boost) — the floor sits between them. Queries that touch a
+# hint content word get +HINT_BOOST, so their effective floor is ~0.40.
 
-WARM_LAYER_TOP_K              = 5
-WARM_LAYER_SCORE_THRESHOLD    = 0.45   # combined (similarity × 0.8 + importance × 0.2)
-WARM_LAYER_SIM_WEIGHT         = 0.8    # heavier similarity weight vs Archive's 0.7
-WARM_LAYER_IMP_WEIGHT         = 0.2
+WARM_LAYER_TOP_K         = 5
+WARM_LAYER_SIM_THRESHOLD = 0.55   # min raw cosine sim (after hint boost)
+WARM_LAYER_HINT_BOOST    = 0.15   # added to sim on content-word context_hint overlap
+WARM_LAYER_SIM_WEIGHT    = 0.8    # ranking weight (heavier similarity vs Archive's 0.7)
+WARM_LAYER_IMP_WEIGHT    = 0.2

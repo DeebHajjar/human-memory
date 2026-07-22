@@ -44,9 +44,9 @@ from config import (
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     FAST_LAYER_PATH,
-    RETRIEVAL_SCORE_THRESHOLD,
+    RETRIEVAL_SIM_THRESHOLD,
     TOP_K_RESULTS,
-    WARM_LAYER_SCORE_THRESHOLD,
+    WARM_LAYER_SIM_THRESHOLD,
     WARM_LAYER_TOP_K,
 )
 from memory import auto_extract
@@ -151,7 +151,10 @@ def get_context(message: str) -> str:
       warm_attributes    — stable biographical/preference facts relevant to
                            this message (v2, may be empty)
       retrieved_memories — relevant past memories from the archive (may be empty)
-      retrieval_triggered         — whether the archive was searched
+      retrieval_triggered         — whether relevant memories were found
+                                    (v2.4: the archive is searched semantically
+                                    on EVERY call; this no longer signals
+                                    whether a search happened)
       warm_retrieval_triggered    — whether any warm attributes were found (v2)
 
     Call this BEFORE generating your response.
@@ -169,14 +172,14 @@ def get_context(message: str) -> str:
         message,
         query_embedding=query_emb,
         top_k=WARM_LAYER_TOP_K,
-        threshold=WARM_LAYER_SCORE_THRESHOLD,
+        threshold=WARM_LAYER_SIM_THRESHOLD,
     )
 
-    # Archive retrieval (keyword-triggered only)
+    # Archive retrieval — semantic search on every message (v2.4, ADR-011)
     memories, triggered = retrieval_engine.get_context_memories(
         message,
         top_k=TOP_K_RESULTS,
-        threshold=RETRIEVAL_SCORE_THRESHOLD,
+        threshold=RETRIEVAL_SIM_THRESHOLD,
     )
 
     context = LayeredContext(
@@ -212,7 +215,11 @@ def store_memory(
         source           — 'user', 'assistant_speech', or 'assistant_thought'.
         importance       — Initial importance 0.0–1.0. If omitted, auto-extraction
                            estimates it from the content (rule-based).
-        tags             — Keywords for future retrieval. If omitted, auto-extracted.
+        tags             — Keywords for future retrieval; a memory whose tag
+                           appears in a later message gets a similarity boost,
+                           so descriptive tags in BOTH the user's languages
+                           (e.g. ["food", "طعام"]) retrieve best.
+                           If omitted, auto-extracted.
         emotional_weight — Significance 0.0–1.0. Set to 1.0 for memories that
                            must NEVER be deleted (e.g. major life events).
                            If omitted, auto-extraction checks for life-event phrasing.

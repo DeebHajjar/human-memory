@@ -146,7 +146,10 @@ All thresholds live in `config.py`:
 | Constant | Default | Meaning |
 |---|---|---|
 | `TOP_K_RESULTS` | 5 | Max memories returned per query |
-| `RETRIEVAL_SCORE_THRESHOLD` | 0.30 | Minimum combined score to include a memory |
+| `RETRIEVAL_SIM_THRESHOLD` | 0.35 | Minimum raw cosine similarity (after tag boost) to include a memory |
+| `RETRIEVAL_TAG_BOOST` | 0.15 | Similarity boost when one of a memory's own tags appears in the message |
+| `WARM_LAYER_SIM_THRESHOLD` | 0.55 | Minimum raw cosine similarity (after hint boost) to surface a warm attribute |
+| `WARM_LAYER_HINT_BOOST` | 0.15 | Similarity boost on a content-word `context_hint` match (stopwords excluded) |
 | `FORGET_LOW_SCORE` / `FORGET_LOW_DAYS` | 0.2 / 30 | Delete below this score after N days |
 | `FORGET_MID_SCORE` / `FORGET_MID_DAYS` | 0.4 / 90 | Compress below this score after N days |
 | `RECENCY_HALF_LIFE_DAYS` | 60 | Exponential decay half-life for recency score |

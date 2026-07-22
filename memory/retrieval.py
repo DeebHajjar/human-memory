@@ -1,47 +1,34 @@
 """
 Retrieval Engine
-Decides when to search the archive and ranks results.
+Semantic search over the Archive, run on EVERY message (v2.4 — ADR-011).
 
-Step 1 — Keyword triggers (fast, no LLM call):
-  • Time/context reference phrases
-  • Any known tag appearing in the message
+The pre-v2.4 keyword trigger gate (time-reference phrases / stored-tag words
+deciding WHETHER to search) was removed: the query embedding is computed
+unconditionally anyway for the Warm Layer, and the gate silently dropped
+high-confidence semantic matches whenever the message didn't happen to
+contain a stored tag word (experiments.md E17).
 
-Step 2 — Semantic search (sentence-transformers, local):
-  • Embed the query
-  • Cosine similarity against all archive embeddings
-  • Rank by combined score = 0.7 × similarity + 0.3 × importance
+Scoring per entry:
+  sim = cosine(query, content embedding)
+      + RETRIEVAL_TAG_BOOST if one of the entry's own tags appears
+        as a word in the message (keyword evidence, not a gate)
+  include only if sim >= threshold (raw similarity — importance never
+  decides inclusion), then rank passers by
+  0.7 × sim + 0.3 × importance, capped at top_k.
 """
 
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
+
+from config import RETRIEVAL_SIM_THRESHOLD, RETRIEVAL_TAG_BOOST
 
 from .archive import ArchiveDB
 from .models import MemoryEntry
 
 logger = logging.getLogger(__name__)
-
-
-# ── Keyword trigger lists ─────────────────────────────────────────────────────
-
-# English time / context references
-_TIME_REFS_EN = [
-    "last time", "remember when", "we discussed", "you mentioned",
-    "earlier", "previously", "last week", "yesterday", "you said",
-    "we talked", "i told you", "as i said", "like before",
-    "same as before", "like last", "again like",
-]
-
-# Arabic time / context references
-_TIME_REFS_AR = [
-    "من قبل", "تذكر", "ذكرت", "قلت", "سبق",
-    "المرة الماضية", "كما قلت", "كنا نتحدث", "ذكرنا",
-    "كما ذكرت", "تحدثنا", "أخبرتك",
-]
-
-TIME_REFS = _TIME_REFS_EN + _TIME_REFS_AR
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -70,41 +57,19 @@ class RetrievalEngine:
         self.archive  = archive
         self.embedder = embedder  # sentence_transformers.SentenceTransformer or None
 
-    # ── Step 1: keyword triggers ──────────────────────────────────────────────
-
-    def should_retrieve(self, message: str) -> bool:
-        """
-        Fast decision — no embedding needed.
-        Returns True if the archive should be searched.
-        """
-        msg_lower = message.lower()
-
-        # Time / context reference phrases
-        if any(ref in msg_lower for ref in TIME_REFS):
-            logger.debug("Retrieval triggered by time reference keyword")
-            return True
-
-        # Any known tag word appears in the message
-        known_tags = self.archive.get_all_tags()
-        if known_tags:
-            words = {w.lower() for w in re.findall(r"\b\w+\b", msg_lower)}
-            if known_tags & words:
-                logger.debug("Retrieval triggered by matching tag in message")
-                return True
-
-        return False
-
-    # ── Step 2: semantic search ───────────────────────────────────────────────
+    # ── Semantic search ───────────────────────────────────────────────────────
 
     def retrieve(
         self,
         message: str,
         top_k: int = 5,
-        threshold: float = 0.30,
+        threshold: float = RETRIEVAL_SIM_THRESHOLD,
     ) -> List[MemoryEntry]:
         """
-        Embed the message, compute similarity against all archive entries,
-        rank by combined score, return top_k above threshold.
+        Embed the message, score every archive entry by raw cosine similarity
+        (plus a tag boost when one of the entry's own tags appears in the
+        message), keep entries with sim >= threshold, rank by combined score
+        (0.7 × sim + 0.3 × importance), return top_k.
         """
         if self.embedder is None:
             logger.warning("No embedder loaded — returning empty results")
@@ -116,14 +81,17 @@ class RetrievalEngine:
         if not all_entries:
             return []
 
+        msg_words = {w.lower() for w in re.findall(r"\b\w+\b", message.lower())}
+
         scored: List[Tuple[float, MemoryEntry]] = []
         for entry, emb in all_entries:
             if emb is None:
                 continue
-            sim   = _cosine_similarity(query_emb, emb)
-            score = _combined_score(sim, entry.importance_score)
-            if score >= threshold:
-                scored.append((score, entry))
+            sim = _cosine_similarity(query_emb, emb)
+            if any(t.lower() in msg_words for t in entry.tags):
+                sim += RETRIEVAL_TAG_BOOST
+            if sim >= threshold:
+                scored.append((_combined_score(sim, entry.importance_score), entry))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         results = [entry for _, entry in scored[:top_k]]
@@ -141,14 +109,12 @@ class RetrievalEngine:
         self,
         message: str,
         top_k: int = 5,
-        threshold: float = 0.30,
+        threshold: float = RETRIEVAL_SIM_THRESHOLD,
     ) -> Tuple[List[MemoryEntry], bool]:
         """
-        Main method called by the MCP server.
-        Returns (memories, retrieval_was_triggered).
+        Main method called by the MCP server and the Gateway.
+        Search always runs; the returned bool means "relevant memories found"
+        (pre-v2.4 it meant "search was attempted at all").
         """
-        triggered = self.should_retrieve(message)
-        if not triggered:
-            return [], False
         memories = self.retrieve(message, top_k=top_k, threshold=threshold)
-        return memories, True
+        return memories, bool(memories)

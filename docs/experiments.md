@@ -48,6 +48,8 @@ Format per experiment: **Question → Method → Result → Conclusion**.
 
 **Conclusion:** Step 1 (keyword-only) retrieval logic works as specified. Known limitation (not a bug): messages that reference past context *without* using a known keyword/tag will not trigger retrieval — this is the documented gap that v4 (LLM-based judgment) is meant to close.
 
+> **Superseded (v2.4):** E18 showed the "known limitation" was in practice the dominant failure mode — the gate silently discarded high-confidence semantic matches on ordinary recall questions. `should_retrieve()` was removed; semantic search now runs on every message (ADR-011).
+
 ---
 
 ### E4: Does the forgetting cycle correctly delete low-importance old entries and protect emotionally significant ones?
@@ -265,3 +267,39 @@ The eager init (SQLite schema, layer managers) is ~0.13s — not the bottleneck;
 **Result (after fix — eager warm-up via FastMCP `lifespan`):** server stderr showed `Warming up embedding model…` → `Embedding model ready in 11.6s — server accepting requests` during `initialize`, i.e. before serving. First `get_context` call: **0.088s**; second: **0.036s** — effectively equal.
 
 **Conclusion:** root cause confirmed as lazy first-use model loading, not DB init or transport lifecycle. Warming the model up at startup (`ADR-010`) shifts the one-time ~12s cost off the first tool call and onto the `initialize` handshake, so the first real request is fast. Symptom (first call hangs, retry works, once per process) is resolved.
+
+---
+
+## v2.4 — Fix (retrieval scoring overhaul)
+
+### E18: Why did bilingual retrieval fail on direct recall questions, and does always-on semantic search with a raw-similarity floor fix it?
+
+**Question:** manual tests against `get_context` (~11 bilingual memories) showed (a) direct recall questions returning nothing in both languages ("What's my cat's name?" / "شو اسم قطتي؟"), (b) poor precision when retrieval did fire (5 results, 1 relevant), (c) Arabic tags mysteriously "fixing" Arabic retrieval, and (d) warm attributes returned for unrelated queries (running → `favorite_programming_language`). Which component is responsible, and do the ADR-011 changes resolve it?
+
+**Method:** replayed the failing queries directly against the live `data/archive.db` with the real embedding model (`paraphrase-multilingual-MiniLM-L12-v2`), computing raw cosine similarity for every stored memory and warm attribute per query, alongside the exact gate/threshold logic from `retrieval.py` / `warm_layer.py`. The harness was then committed as `tools/replay_retrieval.py` and re-run after the fix as the acceptance test.
+
+**Result (diagnosis, before fix):**
+
+| Symptom | Measured cause |
+|---|---|
+| Cat question fails, EN **and** AR | Correct memory at sim **0.547** (decisive) but `should_retrieve()` gate closed — tags `["test","pets"]` share no exact word with either query. Semantic search never ran. |
+| Arabic tags "fixed" Arabic food query | Tag `طعام` appears verbatim in the query → gate opened. Tags are never embedded; the effect was purely the gate. The match itself was marginal (sim 0.223; passed the old 0.30 combined threshold only because importance was 0.5). |
+| EN food query: 5 results, 1 relevant | Combined threshold `0.7×sim + 0.3×imp ≥ 0.30` admits sim ≥ ~0.26; same-person noise band measured 0.25–0.40. Cat memory (0.404) outranked the true answer (0.357). |
+| Warm FPs (running → programming language) | Pass-1 keyword match on `context_hint` matched **stopwords** ("the", "for", "should") and auto-included with fabricated score 0.92 — all 3 warm attributes returned for one running query. Semantic pass also admitted `gender` at sim 0.423 for the food query (effective floor ~0.41). |
+| AR guitar query finds nothing | Levantine query vs Levantine memory: sim **0.031** — genuine embedding-model weakness on dialect; ranked below unrelated memories. |
+
+**Result (after fix — always-on search, raw-sim floors 0.35 archive / 0.55 warm, keyword boosts +0.15):**
+
+| Query | Before | After |
+|---|---|---|
+| "What's my cat's name?" (EN + AR) | nothing | cat memory only (0.547) |
+| "ما هو طعام ديب المفضل؟" | nothing (pre-Arabic-tags) | coffee memory via tag boost (0.223 + 0.15) |
+| "What is Deeb's favorite food?" | 7 passed, cat ranked 1st | coffee ×2 + cat only; marathon/book/router excluded |
+| "How should I plan my training for the half-marathon?" | 3 warm FPs @ 0.92 | marathon memory only; **zero** warm hits |
+| EN food → warm `gender` / `favorite_programming_language` | both returned (0.42–0.43) | both excluded |
+| "What's Deeb's favorite programming language?" | — | warm `favorite_programming_language` only (0.583 raw + 0.15 hint boost); `gender` (0.511) excluded by the 0.55 floor |
+| AR guitar query | nothing | nothing — **expected**: sim 0.031 is a model limitation, unfixable by scoring |
+
+The warm floor was calibrated during this run: at the initially planned 0.50, `gender` (0.511, phrasing-only similarity: "Deeb is …") still passed; 0.55 separates it from the true match (0.583 raw) while hint boosts keep the effective floor ~0.40 for hint-corroborated queries.
+
+**Conclusion:** the dominant failure was architectural (the keyword gate), not the embedding model — the gate discarded a 0.547 match while the query embedding was already being computed for the Warm Layer. Always-on search + raw-similarity floors + keyword-as-boost (ADR-011) resolves symptoms (a)–(d) with no data migration. Residual known limitation: dialectal-Arabic similarity collapse (0.031 monolingual) requires a stronger embedding model — tracked as the follow-up to ADR-005.

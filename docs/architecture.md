@@ -114,7 +114,7 @@ Exposes three tools (`get_context`, `store_memory`, `update_warm_attribute`) ove
 ### 5.1 Retrieval (`get_context` / `build_context`)
 
 ```
-incoming message
+incoming message ── embedded once (sentence-transformers, local), reused by both branches
       │
       ▼
 Fast Layer always loaded (FastLayerManager.load())
@@ -122,24 +122,19 @@ Fast Layer always loaded (FastLayerManager.load())
       ├──────────────────────────────────────────────────────────┐
       │                                                           │
       ▼ (always)                                                 ▼ (always, v2)
-Step 1 — keyword trigger check (RetrievalEngine.should_retrieve()) Warm Layer retrieval (WarmLayerManager.retrieve_relevant())
-  • time/context reference phrases (bilingual EN/AR)              • keyword match on context_hint (fast path)
-  • known-tag word match                                          • cosine similarity on embeddings (fallback)
-      │                                                           • threshold: 0.45
-      ├── no match ──────────────────────────► return Fast Layer + warm_attributes
-      │
-      ▼ match
-Step 2 — semantic search (RetrievalEngine.retrieve())
-  • embed the message (sentence-transformers, local)
-  • cosine similarity against all archive embeddings
-  • combined_score = 0.7 × similarity + 0.3 × importance_score
-  • top_k results above threshold, access stats updated
-      │
-      ▼
+Archive semantic search (RetrievalEngine.retrieve())        Warm Layer retrieval (WarmLayerManager.retrieve_relevant())
+  • cosine similarity against all archive embeddings          • cosine similarity against warm value embeddings
+  • +RETRIEVAL_TAG_BOOST if one of the entry's own tags       • +WARM_LAYER_HINT_BOOST on content-word context_hint
+    appears as a word in the message                            match (bilingual stopwords excluded)
+  • include only if raw sim ≥ RETRIEVAL_SIM_THRESHOLD         • include only if raw sim ≥ WARM_LAYER_SIM_THRESHOLD
+  • rank passers by 0.7 × sim + 0.3 × importance              • rank passers by 0.8 × sim + 0.2 × importance
+  • top_k results, access stats updated                       • top_k results
+      │                                                           │
+      ▼                                                           ▼
 return Fast Layer + warm_attributes + retrieved memories
 ```
 
-Step 2's "LLM judgment" fallback described in the original spec is intentionally not built yet — that's v4 (see `roadmap.md`).
+v2.4 (ADR-011): the former Step-1 keyword trigger gate (`should_retrieve()` — time-reference phrases / stored-tag words deciding *whether* to search) was removed; search runs on every message and keyword signals act as similarity boosts instead. Inclusion is decided by raw similarity only — importance ranks passers but never admits an entry. The "LLM judgment" retrieval fallback described in the original spec is intentionally not built yet — that's v4 (see `roadmap.md`).
 
 ### 5.2 Storage (`store_memory` / `auto_store_turn`)
 

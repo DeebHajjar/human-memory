@@ -9,20 +9,26 @@ semantics: storing a new value for an existing key replaces the old one.
 This is intentional — "I moved to London" should update "location", not
 create a conflicting second entry alongside the old "I live in Dubai".
 
-Retrieval is lightweight compared to a full Archive search:
-  Step 1 — keyword match on context_hint (O(n) but n is tiny: tens of rows)
-  Step 2 — cosine similarity on embeddings for remaining candidates
-  combined = WARM_LAYER_SIM_WEIGHT × similarity + WARM_LAYER_IMP_WEIGHT × importance
-  threshold: WARM_LAYER_SCORE_THRESHOLD (default 0.45 — higher than Archive's 0.30)
+Retrieval (v2.4 — see ADR-011) scores every row by raw cosine similarity:
+  sim = cosine(query, value embedding) [+ WARM_LAYER_HINT_BOOST when a
+        content word of context_hint appears in the message]
+  include only if sim >= WARM_LAYER_SIM_THRESHOLD (importance never gates)
+  rank passers by WARM_LAYER_SIM_WEIGHT × sim + WARM_LAYER_IMP_WEIGHT × importance
 
-Both steps always run over the full warm_layer table since it's expected to
+The hint match ignores stopwords (English + Arabic): hints are natural-language
+sentences, and function words like "the"/"or"/"من" must not count as evidence —
+the pre-v2.4 version auto-included any attribute whose hint shared ANY word
+with the message, which false-positived on nearly every English message.
+
+Scoring always runs over the full warm_layer table since it's expected to
 stay small (< 100 rows). No FAISS index needed here.
 """
 
 import logging
+import re
 import sqlite3
 import struct
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -30,14 +36,42 @@ import numpy as np
 
 from config import (
     EMBEDDING_DIM,
+    WARM_LAYER_HINT_BOOST,
     WARM_LAYER_IMP_WEIGHT,
-    WARM_LAYER_SCORE_THRESHOLD,
+    WARM_LAYER_SIM_THRESHOLD,
     WARM_LAYER_SIM_WEIGHT,
     WARM_LAYER_TOP_K,
 )
 from memory.models import WarmAttribute
 
 logger = logging.getLogger(__name__)
+
+
+# ── Stopwords (bilingual) ─────────────────────────────────────────────────────
+# Only job: stop function words in context hints from counting as keyword
+# evidence. Short and pragmatic, not exhaustive.
+
+_STOPWORDS_EN = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "or", "and",
+    "when", "this", "that", "these", "those", "for", "to", "of", "in", "on",
+    "at", "with", "as", "by", "it", "its", "his", "her", "their", "my", "your",
+    "should", "would", "could", "will", "can", "do", "does", "did", "not",
+    "user", "user's", "users", "use", "about", "asks", "ask", "any", "if",
+    "what", "who", "how", "why", "where", "which",
+}
+
+_STOPWORDS_AR = {
+    "من", "في", "على", "إلى", "الى", "عن", "أن", "ان", "إن", "ما", "هو", "هي",
+    "شو", "يلي", "اللي", "هذا", "هذه", "ذلك", "عند", "كل", "مع", "أو", "او",
+    "و", "لا", "لم", "لن", "قد", "كان", "كانت", "يكون", "التي", "الذي",
+}
+
+_STOPWORDS = _STOPWORDS_EN | _STOPWORDS_AR
+
+
+def _content_words(text: str) -> set:
+    """Lowercased word tokens minus stopwords (same \\b\\w+\\b tokenizer as retrieval.py)."""
+    return {w.lower() for w in re.findall(r"\b\w+\b", text)} - _STOPWORDS
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -114,7 +148,7 @@ class WarmLayerManager:
         elif attribute.embedding is not None:
             emb_blob = attribute.embedding
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         with self._conn() as conn:
             conn.execute(
@@ -202,61 +236,43 @@ class WarmLayerManager:
         message: str,
         query_embedding: Optional[np.ndarray] = None,
         top_k: int = WARM_LAYER_TOP_K,
-        threshold: float = WARM_LAYER_SCORE_THRESHOLD,
+        threshold: float = WARM_LAYER_SIM_THRESHOLD,
     ) -> List[WarmAttribute]:
         """
         Return warm attributes relevant to `message`.
 
-        Two-pass approach:
-          Pass 1 — keyword match on context_hint against message words.
-                   Immediate inclusion without needing embedding.
-          Pass 2 — cosine similarity on embeddings for remaining candidates.
-
-        Combined score = SIM_WEIGHT × similarity + IMP_WEIGHT × importance.
-        Only rows above `threshold` are returned, capped at `top_k`.
+        v2.4 scoring (ADR-011):
+          sim = cosine(query, value embedding)
+              + WARM_LAYER_HINT_BOOST if a content word (stopwords excluded)
+                of context_hint appears in the message
+          include only if sim >= threshold (raw similarity — importance
+          never decides inclusion), then rank passers by
+          SIM_WEIGHT × sim + IMP_WEIGHT × importance, capped at top_k.
         """
+        if query_embedding is None:
+            return []
+
         all_rows = self._get_all_with_embeddings()
         if not all_rows:
             return []
 
-        msg_lower = message.lower()
-        msg_words = set(msg_lower.split())
+        msg_words = _content_words(message)
 
-        keyword_hits: List[Tuple[float, WarmAttribute]] = []
-        remaining: List[Tuple[WarmAttribute, Optional[np.ndarray]]] = []
-
-        # Pass 1: keyword match on context_hint
+        passed: List[Tuple[float, WarmAttribute]] = []
         for attr, emb in all_rows:
-            hint_words = set(attr.context_hint.lower().split())
-            if hint_words & msg_words:
-                # Assign a high score for keyword hits
-                score = WARM_LAYER_SIM_WEIGHT * 1.0 + WARM_LAYER_IMP_WEIGHT * attr.importance
-                keyword_hits.append((score, attr))
-            else:
-                remaining.append((attr, emb))
+            if emb is None:
+                continue
+            sim = _cosine(query_embedding, emb)
+            if _content_words(attr.context_hint) & msg_words:
+                sim += WARM_LAYER_HINT_BOOST
+            if sim >= threshold:
+                rank = WARM_LAYER_SIM_WEIGHT * sim + WARM_LAYER_IMP_WEIGHT * attr.importance
+                passed.append((rank, attr))
 
-        # Pass 2: embedding similarity for non-keyword-matched rows
-        semantic_hits: List[Tuple[float, WarmAttribute]] = []
-        if query_embedding is not None and remaining:
-            for attr, emb in remaining:
-                if emb is None:
-                    continue
-                sim = _cosine(query_embedding, emb)
-                score = WARM_LAYER_SIM_WEIGHT * sim + WARM_LAYER_IMP_WEIGHT * attr.importance
-                if score >= threshold:
-                    semantic_hits.append((score, attr))
-
-        # Merge, de-duplicate by key, sort descending, cap at top_k
-        seen_keys = set()
-        merged: List[Tuple[float, WarmAttribute]] = []
-        for score, attr in sorted(keyword_hits + semantic_hits, key=lambda x: x[0], reverse=True):
-            if attr.key not in seen_keys:
-                seen_keys.add(attr.key)
-                merged.append((score, attr))
-
-        results = [attr for _, attr in merged[:top_k]]
+        passed.sort(key=lambda x: x[0], reverse=True)
+        results = [attr for _, attr in passed[:top_k]]
         logger.debug(
             f"Warm layer retrieved {len(results)} attributes "
-            f"({len(keyword_hits)} keyword, {len(semantic_hits)} semantic)"
+            f"(of {len(all_rows)} rows, sim threshold {threshold})"
         )
         return results

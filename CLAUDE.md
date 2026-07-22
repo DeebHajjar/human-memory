@@ -62,8 +62,10 @@ It's structured as a **pluggable Rule Engine** (`ADR-004`): `FillerSkipRule`, `I
 |---|---|---|---|
 | **Fast Layer** | `data/fast_layer.json` (`fast_layer.py`) | Always, whole | Human-editable core identity. Never searched. |
 | **Warm Layer** (v2) | `warm_layer` table in `archive.db` (`warm_layer.py`) | On semantic relevance | **Upsert by key** — new value replaces old (no contradictory current facts). |
-| **Archive** | `memories` table in `archive.db` (`archive.py`) | On retrieval trigger only | **Append-only.** Every entry permanent until the forgetting cycle prunes it. |
+| **Archive** | `memories` table in `archive.db` (`archive.py`) | Semantic search every message (v2.4, `ADR-011`) | **Append-only.** Every entry permanent until the forgetting cycle prunes it. |
 | Task Layer | — | — | Planned (v3). `active_task_id` in Fast Layer is a placeholder. |
+
+**Retrieval scoring (v2.4, `ADR-011`):** inclusion is decided by **raw cosine similarity only** (`RETRIEVAL_SIM_THRESHOLD` / `WARM_LAYER_SIM_THRESHOLD`); importance ranks passers but never admits an entry. Keyword signals (an entry's own tags, warm `context_hint` content words) are similarity *boosts*, never gates — the pre-v2.4 keyword trigger gate silently dropped high-confidence matches (`experiments.md` E18). `tools/replay_retrieval.py` is the acceptance benchmark for any retrieval-scoring or embedding-model change.
 
 **Dual routing (`ADR-008`):** when `extract_warm()` matches a biographical fact, the Gateway/server upserts it into the Warm Layer *and* appends it to the Archive — the upsert keeps the "current value" clean while the Archive preserves history. A change to warm-attribute extraction must respect both destinations.
 

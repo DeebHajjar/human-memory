@@ -31,6 +31,7 @@ from typing import List, Optional
 
 import numpy as np
 
+from config import RETRIEVAL_SIM_THRESHOLD
 from memory import auto_extract
 from memory.archive import ArchiveDB
 from memory.fast_layer import FastLayerManager
@@ -76,11 +77,13 @@ class MemoryGateway:
         self,
         message: str,
         top_k: int = 5,
-        threshold: float = 0.30,
+        threshold: float = RETRIEVAL_SIM_THRESHOLD,
     ) -> LayeredContext:
         """
         Always returns the Fast Layer. Always runs the Warm Layer retrieval.
-        Runs Archive retrieval only when keyword-triggered.
+        Always runs Archive semantic retrieval (v2.4, ADR-011 — the keyword
+        trigger gate was removed; `retrieval_triggered` in the returned
+        context now means "relevant memories found").
 
         This is called unconditionally — never gated on a tool-call decision
         from the model.
@@ -93,7 +96,7 @@ class MemoryGateway:
         # Warm Layer: always attempted (lightweight — tens of rows at most)
         warm_attrs = self.warm_layer.retrieve_relevant(message, query_embedding=query_emb)
 
-        # Archive: only when keyword-triggered
+        # Archive: semantic search on every message
         memories, triggered = self.retrieval.get_context_memories(
             message, top_k=top_k, threshold=threshold
         )
@@ -218,11 +221,11 @@ class MemoryGateway:
         user_message: str,
         call_model_fn,
         top_k: int = 5,
-        threshold: float = 0.30,
+        threshold: float = RETRIEVAL_SIM_THRESHOLD,
     ) -> str:
         """
         Full deterministic loop for a single turn:
-          1. build_context()          — always (Fast + Warm + Archive if triggered)
+          1. build_context()          — always (Fast + Warm + Archive semantic search)
           2. call_model_fn(context)   — caller-supplied function that calls the
                                         LLM and returns its text response
           3. auto_store_turn()        — always (Warm upsert + Archive store)

@@ -6,6 +6,28 @@ Condensed, scannable diff between versions. For the full reasoning behind any ch
 
 ---
 
+## v2.4 (Fix)
+
+**Theme:** retrieval scoring overhaul — semantic search was gated behind exact-keyword triggers and thresholds admitted noise; measured bilingual testing showed both archive recall and warm-layer precision were broken.
+
+### Fixed
+- **`memory/retrieval.py` — semantic search now runs on EVERY message:** the keyword trigger gate (`should_retrieve()` + time-reference phrase lists) silently discarded high-confidence matches — "What's my cat's name?" scored cosine 0.547 against the stored answer in both English and Arabic and returned nothing because no stored tag word appeared in the query. The gate is removed; the query embedding was already computed unconditionally for the Warm Layer, so this adds no meaningful cost. See [`ADR-011`](decisions/ADR-011-always-on-semantic-retrieval-with-similarity-floor.md) and `experiments.md` E18.
+- **`memory/warm_layer.py` — stopword false positives eliminated:** the Pass-1 keyword match on `context_hint` treated ANY shared word (including "the", "for", "or") as a hit and auto-included the attribute with a fabricated score of 0.92 — one running-training query returned all three stored warm attributes. The auto-include is deleted; hint words now act only as a similarity boost, filtered through bilingual (EN+AR) stopword sets.
+- **Precision — inclusion is now decided by RAW cosine similarity only:** the old combined thresholds (`0.7×sim + 0.3×imp ≥ 0.30` archive, `0.8×sim + 0.2×imp ≥ 0.45` warm) let importance admit entries with near-noise similarity (measured FPs at sim 0.26–0.43). Importance now only ranks results that already passed the similarity floor.
+- **`memory/warm_layer.py`:** `datetime.utcnow()` → `datetime.now(timezone.utc)` in `upsert()` (latent E16-class timezone bug).
+
+### Changed
+- `config.py`: `RETRIEVAL_SCORE_THRESHOLD` (0.30 combined) → **`RETRIEVAL_SIM_THRESHOLD`** (0.35 raw sim); `WARM_LAYER_SCORE_THRESHOLD` (0.45 combined) → **`WARM_LAYER_SIM_THRESHOLD`** (0.55 raw sim, calibrated in E18); new **`RETRIEVAL_TAG_BOOST`** / **`WARM_LAYER_HINT_BOOST`** (both 0.15) — a memory whose own tag (or a hint content word) appears in the message gets a similarity boost. Keyword signals are evidence, never gates.
+- `get_context` / `build_context`: `retrieval_triggered` now means "relevant memories found" (search always runs). Response schema unchanged.
+- `store_memory` docstring: descriptive tags in **both** the user's languages are recommended — tags boost retrieval of that entry but are no longer required for it to be findable.
+- New `tools/replay_retrieval.py`: committed bilingual replay benchmark against the live DB — the acceptance test for this change and for any future embedding-model swap.
+
+### Verified
+- Full before/after acceptance table in `experiments.md` E18: cat question now retrieves in both languages; the Arabic food query retrieves via tag boost; the English food query returns 3 results instead of 7; warm-layer false positives (running → `favorite_programming_language`, food → `gender`) all excluded while the legitimate programming-language probe still retrieves its warm attribute.
+- Known residual (out of scope, needs a stronger embedding model): dialectal-Arabic query vs dialectal-Arabic memory measured sim 0.031 — still not retrievable by any scoring change.
+
+---
+
 ## v2.3 (Fix)
 
 **Theme:** startup timing — the first tool call after a cold server start timed out because the embedding model loaded lazily on first use.
